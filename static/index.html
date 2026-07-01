@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Serial Bridge — ESP32 串口代理</title>
+    <!-- xterm.js (CDN) -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- 工具栏 -->
+    <div id="toolbar">
+        <div class="toolbar-left">
+            <span class="logo">🔌 Serial Bridge</span>
+            <button id="btnMode" class="toolbar-btn" title="切换显示模式">📟 终端模式</button>
+            <span class="separator">|</span>
+            <label>端口:
+                <select id="portSelect"></select>
+            </label>
+            <label>波特率:
+                <select id="baudSelect">
+                    <option value="9600">9600</option>
+                    <option value="57600">57600</option>
+                    <option value="115200" selected>115200</option>
+                    <option value="230400">230400</option>
+                    <option value="921600">921600</option>
+                </select>
+            </label>
+            <button id="btnConnect" class="toolbar-btn success">打开串口</button>
+            <button id="btnDisconnect" class="toolbar-btn danger" disabled>关闭串口</button>
+        </div>
+        <div class="toolbar-right">
+            <button id="btnClearLog" class="toolbar-btn" title="清空日志">🗑 清空</button>
+            <button id="btnAutoScroll" class="toolbar-btn active" title="自动滚动">⬇ 自动滚动</button>
+        </div>
+    </div>
+
+    <!-- 主要内容区 -->
+    <div id="main">
+        <!-- 日志面板模式 (默认) -->
+        <div id="logPanel">
+            <div id="logHeader">
+                <input type="text" id="filterInput" placeholder="关键字过滤（留空显示全部）" />
+                <span id="logCount" class="badge">0 行</span>
+            </div>
+            <div id="logContent"></div>
+        </div>
+
+        <!-- 终端模式 (隐藏) -->
+        <div id="terminalPanel" style="display:none;">
+            <div id="xterm-container"></div>
+        </div>
+
+        <!-- 右侧快捷操作面板 -->
+        <div id="sidePanel">
+            <h3>快捷操作</h3>
+            <button id="btnBuild" class="side-btn">🔨 Build</button>
+            <button id="btnFlash" class="side-btn flash">🔥 Flash</button>
+            <button id="btnClean" class="side-btn">🧹 Clean</button>
+            <button id="btnBmgr" class="side-btn">📦 BMGR</button>
+            <hr>
+            <h3>命令发送</h3>
+            <div id="cmdHistory">
+                <input type="text" id="cmdInput" placeholder="输入命令..." />
+                <button id="btnSend" class="side-btn send">发送</button>
+            </div>
+            <hr>
+            <div id="statusBar">
+                <div><strong>串口:</strong> <span id="statusPort">未连接</span></div>
+                <div><strong>日志:</strong> <span id="statusLogCount">0</span> 行</div>
+                <div><strong>WebSocket:</strong> <span id="statusWs">未连接</span></div>
+                <div><strong>服务:</strong> <span id="statusSvc">检查中...</span></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 日志 -->
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
