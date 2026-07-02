@@ -1,33 +1,32 @@
 @echo off
-chcp 65001 >nul
 cd /d "%~dp0"
 
 echo =======================================
-echo   Serial Bridge — ESP32 串口代理服务
+echo   Serial Bridge - ESP32 Serial Proxy
 echo =======================================
 echo.
 
-:: 使用内置 venv（如果有）
+:: Use venv if available
 if exist "venv\Scripts\python.exe" (
     set PYTHON=venv\Scripts\python.exe
 ) else (
     set PYTHON=python
 )
 
-:: 默认参数
-set PORT=COM6
-set BAUDRATE=115200
-set HTTP_PORT=8080
-set PROJECT_DIR=
+:: Check .env
+if not exist ".env" (
+    if exist ".env.example" (
+        echo [INFO] .env not found, copying from .env.example ...
+        copy .env.example .env >nul
+        echo Please edit .env to configure serial port, then restart.
+        echo.
+    )
+)
 
-:: 检查命令行参数
-if not "%1"=="" set PORT=%1
-if not "%2"=="" set BAUDRATE=%2
-
-echo  串口: %PORT% @ %BAUDRATE%
-echo  HTTP: http://127.0.0.1:%HTTP_PORT%
+echo Config: .env
+echo Web UI: http://127.0.0.1:8080
 echo.
 
-%PYTHON% serial_bridge.py --port %PORT% --baud %BAUDRATE% --port-http %HTTP_PORT% %PROJECT_DIR%
+%PYTHON% serial_bridge.py
 
 pause
