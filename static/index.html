@@ -108,9 +108,16 @@
         <div class="card">
             <div class="card-header">
                 <span>ESP-IDF 工具</span>
+                <button class="btn-icon-sm" id="btnIdfConfig" title="IDF 配置" style="margin-left:auto;margin-right:6px;">⚙</button>
                 <button class="btn-toggle" id="toggleIdf">▾</button>
             </div>
             <div class="card-body" id="idfPanel">
+                <div class="form-row" style="margin-bottom:6px;">
+                    <label style="font-size:11px;color:var(--text-secondary);">当前板型</label>
+                    <select id="idfBoardSelect" class="select" style="font-size:12px;">
+                        <option value="">加载中...</option>
+                    </select>
+                </div>
                 <button id="btnBuild" class="btn btn-ghost btn-block">🔨 编译</button>
                 <button id="btnFlash" class="btn btn-warn btn-block">🔥 烧录</button>
                 <button id="btnClean" class="btn btn-ghost btn-block">🧹 清理</button>
@@ -206,6 +213,47 @@
         <div class="modal-footer">
             <button class="btn btn-ghost" id="cancelCmd">取消</button>
             <button class="btn btn-primary" id="saveCmd">保存</button>
+        </div>
+    </div>
+</div>
+
+<!-- IDF 配置弹窗 -->
+<div class="modal-overlay" id="modalIdfConfig" style="display:none;">
+    <div class="modal">
+        <div class="modal-header">
+            <span>ESP-IDF 配置</span>
+            <button class="btn-close" id="closeIdfConfig">✕</button>
+        </div>
+        <div class="modal-body">
+            <div class="form-row">
+                <label>项目目录</label>
+                <select id="cfgProjectDir" class="select">
+                    <option value="">— 扫描中 —</option>
+                </select>
+            </div>
+            <div class="form-row">
+                <label style="font-size:11px;color:var(--text-secondary);">或手动输入路径</label>
+                <input type="text" id="cfgProjectDirManual" class="input-text" placeholder="D:\code\espclaw\esp-claw\application\edge_agent">
+            </div>
+            <div class="form-row">
+                <label>ESP-IDF 版本</label>
+                <select id="cfgIdfVersion" class="select">
+                    <option value="">— 扫描中 —</option>
+                </select>
+            </div>
+            <div class="form-row">
+                <label>Boards 目录</label>
+                <input type="text" id="cfgBoardsDir" class="input-text" placeholder="boards" value="boards">
+            </div>
+            <div class="form-row">
+                <label>默认板型</label>
+                <input type="text" id="cfgBoard" class="input-text" placeholder="lckfb_szpi_esp32s3" value="lckfb_szpi_esp32s3">
+            </div>
+            <div id="idfConfigStatus" style="font-size:11px;color:var(--text-secondary);margin-top:4px;"></div>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-ghost" id="cancelIdfConfig">取消</button>
+            <button class="btn btn-primary" id="saveIdfConfig">保存并应用</button>
         </div>
     </div>
 </div>

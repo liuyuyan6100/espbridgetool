@@ -251,13 +251,173 @@ async def api_del_quick_command(index: int):
 
 # ---- idf.py 集成 ----
 
+def _reinit_idf(project_dir: str, export_script: str, boards_dir: str, board: str):
+    """重新初始化 IDF 工具实例"""
+    global IDF
+    if not os.path.isdir(project_dir):
+        return False, f"项目目录不存在: {project_dir}"
+    IDF = IdfTool(
+        project_dir=project_dir,
+        export_script=export_script,
+        boards_dir=boards_dir,
+        board=board,
+        on_output=_idf_output_callback,
+    )
+    logger.info(
+        f"IDF 工具已重新初始化, 项目目录: {project_dir}, "
+        f"boards_dir: {boards_dir}, 板型: {board}"
+    )
+    return True, "OK"
+
+
+def _save_env(updates: dict):
+    """将配置更新持久化到 .env 文件"""
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    lines = []
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+    updated_keys = set()
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if "=" in stripped and not stripped.startswith("#"):
+            key = stripped.split("=", 1)[0]
+            if key in updates:
+                new_lines.append(f"{key}={updates[key]}\n")
+                updated_keys.add(key)
+            else:
+                new_lines.append(line)
+        else:
+            new_lines.append(line)
+
+    # 添加 .env 中不存在的新键
+    for key, val in updates.items():
+        if key not in updated_keys:
+            new_lines.append(f"{key}={val}\n")
+
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.writelines(new_lines)
+
+    # 同步更新 os.environ
+    for key, val in updates.items():
+        os.environ[key] = val
+
+
+@app.get("/api/config")
+async def api_get_config():
+    """获取当前 IDF 配置"""
+    return {
+        "ok": True,
+        "config": {
+            "project_dir": os.getenv("IDF_PROJECT_DIR", ""),
+            "export_script": os.getenv("IDF_EXPORT_SCRIPT", ""),
+            "boards_dir": os.getenv("IDF_BOARDS_DIR", "boards"),
+            "board": os.getenv("IDF_BOARD", "lckfb_szpi_esp32s3"),
+            "idf_initialized": IDF is not None,
+        },
+    }
+
+
+@app.post("/api/config")
+async def api_set_config(data: dict):
+    """更新 IDF 配置（运行时生效 + 持久化到 .env）"""
+    updates = {}
+    for key in ["IDF_PROJECT_DIR", "IDF_EXPORT_SCRIPT", "IDF_BOARDS_DIR", "IDF_BOARD"]:
+        if key in data:
+            updates[key] = data[key]
+
+    if not updates:
+        return JSONResponse({"ok": False, "error": "无更新字段"}, status_code=400)
+
+    # 持久化
+    _save_env(updates)
+
+    # 重新初始化 IDF
+    project_dir = os.getenv("IDF_PROJECT_DIR", "")
+    export_script = os.getenv("IDF_EXPORT_SCRIPT", "")
+    boards_dir = os.getenv("IDF_BOARDS_DIR", "boards")
+    board = os.getenv("IDF_BOARD", "lckfb_szpi_esp32s3")
+
+    if project_dir:
+        ok, msg = _reinit_idf(project_dir, export_script, boards_dir, board)
+        return {"ok": ok, "message": msg if not ok else "配置已更新并生效"}
+    else:
+        return {"ok": True, "message": "配置已保存（项目目录为空，IDF 未初始化）"}
+
+
+@app.get("/api/idf-versions")
+async def api_idf_versions():
+    """扫描可用的 ESP-IDF 版本"""
+    versions = []
+    # 扫描 C:\esp\ 下的版本目录
+    esp_root = os.getenv("IDF_SCAN_ROOT", r"C:\esp")
+    if os.path.isdir(esp_root):
+        for name in os.listdir(esp_root):
+            export_path = os.path.join(esp_root, name, "esp-idf", "export.ps1")
+            if os.path.isfile(export_path):
+                versions.append({
+                    "version": name,
+                    "export_script": export_path,
+                })
+
+    # 如果当前 export_script 不在扫描结果中，添加它
+    current = os.getenv("IDF_EXPORT_SCRIPT", "")
+    if current and not any(v["export_script"] == current for v in versions):
+        versions.insert(0, {
+            "version": "当前配置",
+            "export_script": current,
+        })
+
+    return {"ok": True, "versions": versions}
+
+
+@app.get("/api/idf-projects")
+async def api_idf_projects():
+    """扫描可用的 ESP-IDF 项目目录"""
+    projects = []
+    # 扫描常见目录
+    scan_dirs = [
+        r"D:\code\espclaw",
+        r"D:\code",
+    ]
+    for scan_dir in scan_dirs:
+        if not os.path.isdir(scan_dir):
+            continue
+        for root, dirs, files in os.walk(scan_dir):
+            # 只扫描 3 层深度
+            depth = root[len(scan_dir):].count(os.sep)
+            if depth >= 3:
+                dirs[:] = []
+                continue
+            if "CMakeLists.txt" in files and "boards" in dirs:
+                rel = os.path.relpath(root, scan_dir)
+                projects.append({
+                    "path": root,
+                    "name": rel,
+                })
+            # 跳过 .git, build, __pycache__
+            dirs[:] = [d for d in dirs if d not in (".git", "build", "__pycache__", "node_modules")]
+
+    # 去重
+    seen = set()
+    unique = []
+    for p in projects:
+        if p["path"] not in seen:
+            seen.add(p["path"])
+            unique.append(p)
+
+    return {"ok": True, "projects": unique}
+
+
 @app.post("/api/build")
 async def api_build(data: dict = {}):
     """触发编译"""
     global IDF
     if IDF is None:
         return JSONResponse(
-            {"ok": False, "error": "IDF 工具未初始化，未设置项目目录"},
+            {"ok": False, "error": "IDF 工具未初始化，请在配置中设置项目目录"},
             status_code=400,
         )
     board = data.get("board")
