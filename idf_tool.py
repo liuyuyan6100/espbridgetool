@@ -106,6 +106,7 @@ class IdfTool:
 
         try:
             process = subprocess.Popen(
+                ps_command,
                 cwd=self.project_dir,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
