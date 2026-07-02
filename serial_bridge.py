@@ -474,14 +474,22 @@ async def api_bmgr(data: dict = {}):
 
 @app.get("/api/boards")
 async def api_list_boards():
-    """列出可用板型"""
+    """列出可用板型（IDF 未初始化时尝试自动初始化）"""
     global IDF
+    # 如果 IDF 未初始化但 .env 中有项目目录，尝试自动初始化
     if IDF is None:
-        return JSONResponse(
-            {"ok": False, "error": "IDF 工具未初始化"}, status_code=400
-        )
+        project_dir = os.getenv("IDF_PROJECT_DIR", "")
+        if project_dir and os.path.isdir(project_dir):
+            export_script = os.getenv("IDF_EXPORT_SCRIPT", r"C:\esp\v5.5.4\esp-idf\export.ps1")
+            boards_dir = os.getenv("IDF_BOARDS_DIR", "boards")
+            board = os.getenv("IDF_BOARD", "lckfb_szpi_esp32s3")
+            _reinit_idf(project_dir, export_script, boards_dir, board)
+
+    if IDF is None:
+        return {"ok": True, "boards": [], "current": "", "error": "未配置项目目录"}
+
     ok, boards = IDF.list_boards()
-    return {"ok": ok, "boards": boards, "current": IDF.board}
+    return {"ok": True, "boards": boards, "current": IDF.board}
 
 
 @app.post("/api/boards/select")

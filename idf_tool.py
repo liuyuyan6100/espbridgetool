@@ -72,33 +72,40 @@ class IdfTool:
             timeout: 超时秒数
             env_extra: 额外环境变量
         """
-        # 构造 PowerShell 命令：设置 UTF-8 环境 + source export.ps1 + 执行 idf.py
-        env_setup = (
-            "$env:PYTHONUTF8 = '1'; "
-            "$env:PYTHONIOENCODING = 'utf-8'; "
-            f"$env:ESP_BMGR_LOCK_TIMEOUT = '120'; "
+        # 构造 PowerShell 命令：用分号连接，避免 & 被 shell 误解析
+        export_escaped = self.export_script.replace("'", "''")
+        idf_args = " ".join(cmd)
+
+        # 用脚本块包裹，确保环境变量在同一个作用域内生效
+        ps_script = (
+            f"$env:PYTHONUTF8='1'; "
+            f"$env:PYTHONIOENCODING='utf-8'; "
+            f"$env:ESP_BMGR_LOCK_TIMEOUT='120'; "
+            f". '{export_escaped}'; "
+            f"idf.py {idf_args}"
         )
-        export_cmd = f". '{self.export_script}'"
-        idf_cmd = " & ".join([env_setup, export_cmd, "idf.py " + " ".join(cmd)])
+
+        # 合并环境变量（Python 层面也设一份，防 subprocess 继承问题）
+        env = os.environ.copy()
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["ESP_BMGR_LOCK_TIMEOUT"] = "120"
+        if env_extra:
+            env.update(env_extra)
+
+        logger.info(f"运行 idf.py 命令: {' '.join(cmd)} (cwd={self.project_dir})")
+
         ps_command = [
             "powershell.exe",
             "-NoProfile",
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
-            idf_cmd,
+            ps_script,
         ]
-
-        # 合并环境变量
-        env = os.environ.copy()
-        if env_extra:
-            env.update(env_extra)
-
-        logger.info(f"运行 idf.py 命令: {' '.join(cmd)} (cwd={self.project_dir})")
 
         try:
             process = subprocess.Popen(
-                ps_command,
                 cwd=self.project_dir,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
