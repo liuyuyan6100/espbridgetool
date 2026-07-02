@@ -24,4 +24,5 @@ sdkconfig.old
 *.log
 
 # 环境配置（不提交实际配置，只提交 .env.example）
-.env.workbuddy/
+.env
+.workbuddy/
