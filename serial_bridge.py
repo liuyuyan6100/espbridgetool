@@ -301,7 +301,7 @@ async def api_clean():
 
 @app.post("/api/bmgr")
 async def api_bmgr(data: dict = {}):
-    """触发 bmgr"""
+    """触发 bmgr 选择板型"""
     global IDF
     if IDF is None:
         return JSONResponse(
@@ -310,6 +310,45 @@ async def api_bmgr(data: dict = {}):
     board = data.get("board")
     ok, output = IDF.bmgr(board=board)
     return {"ok": ok, "output": output[:500] if not ok else "bmgr 完成"}
+
+
+@app.get("/api/boards")
+async def api_list_boards():
+    """列出可用板型"""
+    global IDF
+    if IDF is None:
+        return JSONResponse(
+            {"ok": False, "error": "IDF 工具未初始化"}, status_code=400
+        )
+    ok, boards = IDF.list_boards()
+    return {"ok": ok, "boards": boards, "current": IDF.board}
+
+
+@app.post("/api/boards/select")
+async def api_select_board(data: dict):
+    """选择板型"""
+    global IDF
+    if IDF is None:
+        return JSONResponse(
+            {"ok": False, "error": "IDF 工具未初始化"}, status_code=400
+        )
+    board = data.get("board")
+    if not board:
+        return JSONResponse({"ok": False, "error": "缺少 board 参数"}, status_code=400)
+    ok, output = IDF.select_board(board)
+    return {"ok": ok, "board": board, "output": output[:500] if not ok else "选择成功"}
+
+
+@app.post("/api/menuconfig")
+async def api_menuconfig():
+    """触发 menuconfig（需终端环境，Web 下可能不工作）"""
+    global IDF
+    if IDF is None:
+        return JSONResponse(
+            {"ok": False, "error": "IDF 工具未初始化"}, status_code=400
+        )
+    ok, output = IDF.menuconfig()
+    return {"ok": ok, "output": output[:500] if not ok else "menuconfig 退出"}
 
 
 # ---- WebSocket ----
@@ -378,6 +417,8 @@ def main():
     idf_export = args.idf_export or os.getenv(
         "IDF_EXPORT_SCRIPT", r"C:\esp\v5.5.4\esp-idf\export.ps1"
     )
+    boards_dir = os.getenv("IDF_BOARDS_DIR", "boards")
+    default_board = os.getenv("IDF_BOARD", "lckfb_szpi_esp32s3")
 
     # 命令行端口覆盖 .env（在 lifespan 中读取 .env 自动连接）
     if args.port:
@@ -393,9 +434,14 @@ def main():
         IDF = IdfTool(
             project_dir=project_dir,
             export_script=idf_export,
+            boards_dir=boards_dir,
+            board=default_board,
             on_output=_idf_output_callback,
         )
-        logger.info(f"IDF 工具已初始化, 项目目录: {project_dir}")
+        logger.info(
+            f"IDF 工具已初始化, 项目目录: {project_dir}, "
+            f"boards_dir: {boards_dir}, 板型: {default_board}"
+        )
     else:
         logger.info("未设置项目目录，编译/烧录功能不可用")
 
