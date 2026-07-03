@@ -802,7 +802,16 @@ def main():
 
     # 启动 Web 服务
     logger.info(f"启动 Web 服务: http://{host}:{http_port}")
-    uvicorn.run(app, host=host, port=http_port, log_level="info")
+
+    # 关闭 uvicorn 访问日志（GET /api/status 轮询等噪音），
+    # 保留启动/关闭/错误等关键日志
+    uvicorn.run(
+        app,
+        host=host,
+        port=http_port,
+        log_level="info",
+        access_log=False,
+    )
 
 
 if __name__ == "__main__":
