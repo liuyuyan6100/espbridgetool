@@ -113,16 +113,11 @@
                 <button class="btn-toggle" id="toggleIdf">▾</button>
             </div>
             <div class="card-body" id="idfPanel">
-                <div class="form-row" style="margin-bottom:6px;">
-                    <label style="font-size:11px;color:var(--text-secondary);">当前板型</label>
-                    <select id="idfBoardSelect" class="select" style="font-size:12px;">
-                        <option value="">加载中...</option>
-                    </select>
+                <div style="font-size:11px;color:var(--text-secondary);margin-bottom:8px;">
+                    编译/烧录请在「终端·Shell」中执行 idf.py build/flash
                 </div>
-                <button id="btnBuild" class="btn btn-ghost btn-block">🔨 编译</button>
-                <button id="btnFlash" class="btn btn-warn btn-block">🔥 烧录</button>
-                <button id="btnClean" class="btn btn-ghost btn-block">🧹 清理</button>
-                <button id="btnBmgr" class="btn btn-ghost btn-block">📦 BMGR</button>
+                <button id="btnClean" class="btn btn-ghost btn-block">🧹 清理 (fullclean)</button>
+                <button id="btnBmgr" class="btn btn-ghost btn-block">📦 BMGR (选板型)</button>
             </div>
         </div>
     </aside>

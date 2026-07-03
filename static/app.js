@@ -499,52 +499,10 @@ async function runIdfAction(action, body = {}) {
     }
 }
 
-$('btnBuild').addEventListener('click', () => runIdfAction('build'));
-$('btnFlash').addEventListener('click', () => {
-    if (confirm('确认触发烧录？将自动释放串口并重新连接。')) {
-        runIdfAction('flash');
-    }
-});
 $('btnClean').addEventListener('click', () => runIdfAction('clean'));
 $('btnBmgr').addEventListener('click', () => runIdfAction('bmgr'));
 
 // ============ IDF 配置 ============
-async function loadIdfBoards() {
-    try {
-        const res = await fetch('/api/boards');
-        const data = await res.json();
-        const sel = $('idfBoardSelect');
-        if (data.ok && data.boards && data.boards.length) {
-            sel.innerHTML = data.boards.map(b =>
-                `<option value="${b}" ${b === data.current ? 'selected' : ''}>${b}</option>`
-            ).join('');
-        } else {
-            sel.innerHTML = '<option value="">无可用板型</option>';
-        }
-    } catch (e) {
-        $('idfBoardSelect').innerHTML = '<option value="">加载失败</option>';
-    }
-}
-
-$('idfBoardSelect').addEventListener('change', async (e) => {
-    const board = e.target.value;
-    if (!board) return;
-    try {
-        const res = await fetch('/api/boards/select', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ board }),
-        });
-        const data = await res.json();
-        if (data.ok) {
-            toast(`已选择板型: ${board}`, 'success');
-        } else {
-            toast(`选择失败: ${data.error || ''}`, 'error');
-        }
-    } catch (e) {
-        toast('请求失败: ' + e.message, 'error');
-    }
-});
 
 async function loadIdfConfig() {
     const statusEl = $('idfConfigStatus');
@@ -635,7 +593,6 @@ $('saveIdfConfig').addEventListener('click', async () => {
         if (data.ok) {
             toast('配置已保存并生效', 'success');
             $('modalIdfConfig').style.display = 'none';
-            loadIdfBoards();
         } else {
             statusEl.textContent = '✗ ' + (data.error || data.message || '保存失败');
             statusEl.style.color = 'var(--danger, #ef5350)';
@@ -786,7 +743,6 @@ document.querySelectorAll('#viewModeGroup .seg-btn').forEach(btn => {
 refreshPorts();
 updateStats();
 loadQuickCommands();
-loadIdfBoards();
 connectWs();
 setInterval(updateStats, 3000);
 
