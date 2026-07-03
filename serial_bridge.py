@@ -605,12 +605,12 @@ async def ws_terminal(websocket: WebSocket, mode: str = "serial"):
             logger.info("终端断开 (serial)")
 
     elif mode == "shell":
-        # ---- Shell 模式（pywinpty）----
+        # ---- Shell 模式（winpty）----
         try:
-            from pywinpty import PTY
+            from winpty import PTY
         except ImportError:
             await websocket.send_text(
-                "[bridge] pywinpty 未安装，无法启动 Shell 终端\r\n"
+                "[bridge] winpty 未安装，无法启动 Shell 终端\r\n"
                 "请运行: pip install pywinpty\r\n"
             )
             return
