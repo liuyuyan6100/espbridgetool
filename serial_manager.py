@@ -21,9 +21,22 @@ class SerialManager:
         self._ser: Optional[serial.Serial] = None
         self._reading = False
         self._reader_thread: Optional[threading.Thread] = None
-        self._on_data = on_data  # 回调：收到数据时推送
         self._lock = threading.Lock()
         self._closed_manually = False
+        # 支持多个数据回调（日志 + 终端同时收数据）
+        self._on_data_callbacks: list[Callable[[bytes], None]] = []
+        if on_data:
+            self._on_data_callbacks.append(on_data)
+
+    def add_callback(self, cb: Callable[[bytes], None]) -> None:
+        """注册数据回调"""
+        if cb not in self._on_data_callbacks:
+            self._on_data_callbacks.append(cb)
+
+    def remove_callback(self, cb: Callable[[bytes], None]) -> None:
+        """移除数据回调"""
+        if cb in self._on_data_callbacks:
+            self._on_data_callbacks.remove(cb)
 
     # ---- 属性 ----
 
@@ -127,8 +140,12 @@ class SerialManager:
             try:
                 if self.is_open:
                     data = self._ser.read(1024)
-                    if data and self._on_data:
-                        self._on_data(data)
+                    if data:
+                        for cb in self._on_data_callbacks:
+                            try:
+                                cb(data)
+                            except Exception as e:
+                                logger.warning(f"串口数据回调异常: {e}")
                     retry_count = 0  # 成功读取，重置重试计数
                 else:
                     # 串口断开，尝试自动重连

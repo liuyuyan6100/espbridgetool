@@ -676,6 +676,112 @@ function toast(msg, type = 'info') {
     setTimeout(() => el.remove(), 3000);
 }
 
+// ============ 终端模式（xterm.js） ============
+let term = null;
+let termFit = null;
+let termWs = null;
+let currentMode = 'log';  // log | serial | shell
+
+function initTerminal() {
+    if (term) return;
+    term = new Terminal({
+        fontSize: 13,
+        fontFamily: 'Consolas, "Courier New", monospace',
+        cursorBlink: true,
+        convertEol: false,
+        scrollback: 5000,
+    });
+    termFit = new FitAddon.FitAddon();
+    term.loadAddon(termFit);
+    term.open($('terminalView'));
+    termFit.fit();
+
+    term.onData((data) => {
+        if (termWs && termWs.readyState === WebSocket.OPEN) {
+            termWs.send(data);
+        }
+    });
+
+    window.addEventListener('resize', () => {
+        if (currentMode !== 'log' && termFit) termFit.fit();
+    });
+}
+
+function connectTerminal(mode) {
+    // 断开旧连接
+    if (termWs) {
+        termWs.close();
+        termWs = null;
+    }
+
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url = `${proto}//${location.host}/ws/terminal?mode=${mode}`;
+    termWs = new WebSocket(url);
+    termWs.binaryType = 'arraybuffer';
+
+    $('termStatus').textContent = '连接中...';
+
+    termWs.onopen = () => {
+        $('termStatus').textContent = mode === 'serial' ? '串口已连接' : 'Shell 已连接';
+        if (term) term.focus();
+    };
+
+    termWs.onmessage = (evt) => {
+        if (!term) return;
+        if (evt.data instanceof ArrayBuffer) {
+            term.write(new Uint8Array(evt.data));
+        } else if (evt.data instanceof Blob) {
+            evt.data.arrayBuffer().then(buf => term.write(new Uint8Array(buf)));
+        } else {
+            term.write(evt.data);
+        }
+    };
+
+    termWs.onclose = () => {
+        $('termStatus').textContent = '已断开';
+        if (term) term.write('\r\n\x1b[31m[bridge] 终端已断开\x1b[0m\r\n');
+    };
+
+    termWs.onerror = () => {
+        $('termStatus').textContent = '连接错误';
+    };
+}
+
+// 视图模式切换
+document.querySelectorAll('#viewModeGroup .seg-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+        const mode = btn.dataset.mode;
+        if (mode === currentMode) return;
+
+        document.querySelectorAll('#viewModeGroup .seg-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+
+        currentMode = mode;
+
+        if (mode === 'log') {
+            // 日志模式
+            $('logView').style.display = '';
+            $('sendArea').style.display = '';
+            $('terminalView').style.display = 'none';
+            $('logControls').style.display = 'flex';
+            $('termControls').style.display = 'none';
+            // 断开终端 WS
+            if (termWs) { termWs.close(); termWs = null; }
+        } else {
+            // 终端模式
+            $('logView').style.display = 'none';
+            $('sendArea').style.display = 'none';
+            $('terminalView').style.display = '';
+            $('logControls').style.display = 'none';
+            $('termControls').style.display = 'inline-flex';
+
+            initTerminal();
+            setTimeout(() => termFit.fit(), 50);
+            connectTerminal(mode);
+        }
+    });
+});
+
 // ============ 初始化 ============
 refreshPorts();
 updateStats();
@@ -684,4 +790,4 @@ loadIdfBoards();
 connectWs();
 setInterval(updateStats, 3000);
 
-console.log('Serial Bridge v1.2 已加载');
+console.log('Serial Bridge v1.3 已加载（含终端模式）');

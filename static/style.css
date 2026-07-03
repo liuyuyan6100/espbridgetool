@@ -339,6 +339,20 @@ body {
     word-break: break-all;
     white-space: pre-wrap;
 }
+
+/* ===== 终端视图 ===== */
+.terminal-view {
+    flex: 1;
+    overflow: hidden;
+    padding: 4px 8px;
+    background: #0c0c0c;
+}
+.terminal-view .xterm {
+    height: 100%;
+}
+.terminal-view .xterm-viewport {
+    background: #0c0c0c !important;
+}
 .log-view .line {
     padding: 0 4px;
     border-radius: 2px;

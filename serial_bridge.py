@@ -7,9 +7,11 @@
 """
 
 import argparse
+import asyncio
 import logging
 import os
 import sys
+import threading
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
@@ -550,6 +552,142 @@ async def ws_log(websocket: WebSocket):
         if websocket in WS_CLIENTS:
             WS_CLIENTS.remove(websocket)
         logger.info(f"WebSocket 客户端断开, 当前在线: {len(WS_CLIENTS)}")
+
+
+# ---- 终端 WebSocket（方案 3：xterm.js 全终端）----
+
+def _make_terminal_callback(ws: WebSocket, loop: asyncio.AbstractEventLoop):
+    """创建一个串口数据回调，把原始 bytes 推给指定终端 WS"""
+    async def _push(data: bytes):
+        try:
+            await ws.send_bytes(data)
+        except Exception:
+            pass
+
+    def callback(data: bytes):
+        if loop.is_running():
+            asyncio.ensure_future(_push(data), loop=loop)
+    return callback
+
+
+@app.websocket("/ws/terminal")
+async def ws_terminal(websocket: WebSocket, mode: str = "serial"):
+    """终端 WebSocket — 支持 serial / shell 双模式
+
+    GET /ws/terminal?mode=serial  —— 串口终端（连 ESP32 设备）
+    GET /ws/terminal?mode=shell   —— Shell 终端（执行 idf.py 等命令）
+    """
+    await websocket.accept()
+    loop = asyncio.get_event_loop()
+    logger.info(f"终端连接: mode={mode}")
+
+    if mode == "serial":
+        # ---- 串口模式 ----
+        if not SERIAL.is_open:
+            await websocket.send_text("[bridge] 串口未打开，请先连接串口\r\n")
+
+        cb = _make_terminal_callback(websocket, loop)
+        SERIAL.add_callback(cb)
+
+        try:
+            while True:
+                msg = await websocket.receive()
+                if "bytes" in msg:
+                    SERIAL.send(msg["bytes"])
+                elif "text" in msg:
+                    SERIAL.send(msg["text"].encode("utf-8"))
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            logger.warning(f"终端异常: {e}")
+        finally:
+            SERIAL.remove_callback(cb)
+            logger.info("终端断开 (serial)")
+
+    elif mode == "shell":
+        # ---- Shell 模式（pywinpty）----
+        try:
+            from pywinpty import PTY
+        except ImportError:
+            await websocket.send_text(
+                "[bridge] pywinpty 未安装，无法启动 Shell 终端\r\n"
+                "请运行: pip install pywinpty\r\n"
+            )
+            return
+
+        # 启动 PTY — 用 cmd.exe，通过初始化命令设置环境
+        pty = PTY(120, 30)
+        shell_path = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
+        pty.spawn(shell_path)
+
+        # 发送初始化命令：source ESP-IDF + cd 项目目录
+        init_cmds = []
+        export_script = os.getenv("IDF_EXPORT_SCRIPT", "")
+        project_dir = os.getenv("IDF_PROJECT_DIR", "")
+
+        if export_script and os.path.isfile(export_script):
+            # 用 powershell 加载 export 脚本，再切回 cmd
+            init_cmds.append(
+                f'powershell -NoProfile -Command ". \'{export_script}\'"'
+            )
+        if project_dir and os.path.isdir(project_dir):
+            init_cmds.append(f'cd /d "{project_dir}"')
+
+        init_cmds.append("echo [bridge] Shell 终端就绪，IDF 环境已加载")
+        for cmd in init_cmds:
+            pty.write(cmd + "\r\n")
+
+        # 后台线程：持续读取 PTY 输出 → 推到 WS
+        pty_running = True
+
+        def _pty_reader():
+            while pty_running:
+                try:
+                    data = pty.read()
+                    if data:
+                        # data 是 str，转成 bytes 推给 WS
+                        if loop.is_running():
+                            asyncio.ensure_future(
+                                _send_pty_data(websocket, data), loop=loop
+                            )
+                except Exception:
+                    break
+                import time
+                time.sleep(0.02)
+
+        async def _send_pty_data(ws, data):
+            try:
+                if isinstance(data, str):
+                    await ws.send_bytes(data.encode("utf-8", errors="replace"))
+                else:
+                    await ws.send_bytes(data)
+            except Exception:
+                pass
+
+        reader_thread = threading.Thread(target=_pty_reader, daemon=True)
+        reader_thread.start()
+
+        try:
+            while True:
+                msg = await websocket.receive()
+                if "bytes" in msg:
+                    pty.write(msg["bytes"].decode("utf-8", errors="replace"))
+                elif "text" in msg:
+                    pty.write(msg["text"])
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            logger.warning(f"终端异常: {e}")
+        finally:
+            pty_running = False
+            try:
+                pty.write("exit\r\n")
+            except Exception:
+                pass
+            logger.info("终端断开 (shell)")
+
+    else:
+        await websocket.send_text(f"[bridge] 未知模式: {mode}\r\n")
 
 
 # ---- Web 前端页面 ----

@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Serial Bridge — ESP32 串口调试</title>
     <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
 </head>
 <body>
 
@@ -128,20 +129,30 @@
 
     <!-- 主内容区 -->
     <main class="main">
-        <!-- 日志工具栏 -->
+        <!-- 视图切换工具栏 -->
         <div class="log-toolbar">
             <div class="toolbar-left">
-                <div class="seg-group">
-                    <button class="seg-btn active" data-view="text" id="viewText">文本</button>
-                    <button class="seg-btn" data-view="hex" id="viewHex">HEX</button>
-                    <button class="seg-btn" data-view="ansi" id="viewAnsi">彩色</button>
+                <div class="seg-group" id="viewModeGroup">
+                    <button class="seg-btn active" data-mode="log" id="modeLog">日志</button>
+                    <button class="seg-btn" data-mode="serial" id="modeSerial">终端·串口</button>
+                    <button class="seg-btn" data-mode="shell" id="modeShell">终端·Shell</button>
                 </div>
-                <label class="checkbox">
-                    <input type="checkbox" id="autoScroll" checked> 自动滚动
-                </label>
-                <label class="checkbox">
-                    <input type="checkbox" id="showTs"> 时间戳
-                </label>
+                <span id="logControls" style="display:flex;align-items:center;gap:8px;">
+                    <div class="seg-group">
+                        <button class="seg-btn active" data-view="text" id="viewText">文本</button>
+                        <button class="seg-btn" data-view="hex" id="viewHex">HEX</button>
+                        <button class="seg-btn" data-view="ansi" id="viewAnsi">彩色</button>
+                    </div>
+                    <label class="checkbox">
+                        <input type="checkbox" id="autoScroll" checked> 自动滚动
+                    </label>
+                    <label class="checkbox">
+                        <input type="checkbox" id="showTs"> 时间戳
+                    </label>
+                </span>
+                <span id="termControls" style="display:none;align-items:center;gap:8px;font-size:12px;color:var(--text-secondary);">
+                    <span id="termStatus">未连接</span>
+                </span>
             </div>
             <div class="toolbar-right">
                 <input type="text" id="filterInput" class="input-filter" placeholder="过滤关键字...">
@@ -153,8 +164,11 @@
         <!-- 日志显示区 -->
         <div class="log-view" id="logView"></div>
 
+        <!-- 终端显示区（xterm.js） -->
+        <div class="terminal-view" id="terminalView" style="display:none;"></div>
+
         <!-- 发送区 -->
-        <div class="send-area">
+        <div class="send-area" id="sendArea">
             <div class="send-options">
                 <label class="checkbox">
                     <input type="checkbox" id="hexSend"> HEX 发送
@@ -258,6 +272,8 @@
     </div>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>
