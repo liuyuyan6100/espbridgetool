@@ -227,14 +227,34 @@ $('showTs').addEventListener('change', (e) => {
 
 $('btnClearLog').addEventListener('click', clearLog);
 
+// ============ 日志导出/清空 ============
 $('btnExport').addEventListener('click', () => {
-    const text = logLines.map(l => stripAnsi(l.text)).join('');
-    const blob = new Blob([text], { type: 'text/plain' });
+    if (!logLines.length) {
+        toast('日志为空，无需导出', 'warning');
+        return;
+    }
+    const text = logLines.map(l => stripAnsi(l.text)).join('\n');
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = `serial_log_${Date.now()}.txt`;
+    const now = new Date();
+    const ts = `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}_${String(now.getHours()).padStart(2,'0')}${String(now.getMinutes()).padStart(2,'0')}`;
+    a.download = `serial_log_${ts}.txt`;
     a.click();
     URL.revokeObjectURL(a.href);
+    toast(`已导出 ${logLines.length} 行日志`, 'success');
+});
+
+// 清空前二次确认
+$('btnClearLog').addEventListener('click', () => {
+    if (!logLines.length) {
+        toast('日志已经是空的', 'warning');
+        return;
+    }
+    if (confirm(`确认清空 ${logLines.length} 条日志？此操作不可撤销。`)) {
+        clearLog();
+        toast('日志已清空', 'success');
+    }
 });
 
 // ============ 串口操作 ============
@@ -478,129 +498,6 @@ $('saveCmd').addEventListener('click', async () => {
     });
     $('modalAddCmd').style.display = 'none';
     loadQuickCommands();
-});
-
-// ============ IDF 工具 ============
-async function runIdfAction(action, body = {}) {
-    try {
-        const res = await fetch('/api/' + action, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-        });
-        const data = await res.json();
-        if (!data.ok && data.error) {
-            toast(`${action} 失败: ${data.error}`, 'error');
-        } else {
-            toast(`${action} 完成`, 'success');
-        }
-    } catch (e) {
-        toast(`${action} 请求失败: ${e.message}`, 'error');
-    }
-}
-
-$('btnClean').addEventListener('click', () => runIdfAction('clean'));
-$('btnBmgr').addEventListener('click', () => runIdfAction('bmgr'));
-
-// ============ IDF 配置 ============
-
-async function loadIdfConfig() {
-    const statusEl = $('idfConfigStatus');
-    statusEl.textContent = '加载中...';
-
-    // 并行加载配置、IDF 版本、项目目录
-    const [configRes, versionsRes, projectsRes] = await Promise.all([
-        fetch('/api/config').then(r => r.json()).catch(() => null),
-        fetch('/api/idf-versions').then(r => r.json()).catch(() => null),
-        fetch('/api/idf-projects').then(r => r.json()).catch(() => null),
-    ]);
-
-    // 填充项目目录下拉框
-    const projSel = $('cfgProjectDir');
-    const projects = projectsRes?.projects || [];
-    const currentProj = configRes?.config?.project_dir || '';
-    if (projects.length) {
-        projSel.innerHTML = projects.map(p =>
-            `<option value="${p.path}" ${p.path === currentProj ? 'selected' : ''}>${p.name}</option>`
-        ).join('') + (currentProj && !projects.find(p => p.path === currentProj)
-            ? `<option value="${currentProj}" selected>${currentProj}</option>` : '');
-    } else {
-        projSel.innerHTML = '<option value="">未扫描到项目</option>';
-    }
-    $('cfgProjectDirManual').value = currentProj;
-
-    // 填充 IDF 版本下拉框
-    const verSel = $('cfgIdfVersion');
-    const versions = versionsRes?.versions || [];
-    const currentScript = configRes?.config?.export_script || '';
-    if (versions.length) {
-        verSel.innerHTML = versions.map(v =>
-            `<option value="${v.export_script}" ${v.export_script === currentScript ? 'selected' : ''}>${v.version}</option>`
-        ).join('');
-    } else {
-        verSel.innerHTML = '<option value="">未扫描到版本</option>';
-    }
-
-    // 填充其他字段
-    $('cfgBoardsDir').value = configRes?.config?.boards_dir || 'boards';
-    $('cfgBoard').value = configRes?.config?.board || 'lckfb_szpi_esp32s3';
-
-    const initialized = configRes?.config?.idf_initialized;
-    statusEl.textContent = initialized ? '✓ IDF 已初始化' : '⚠ IDF 未初始化（请设置项目目录）';
-    statusEl.style.color = initialized ? 'var(--success, #43a047)' : 'var(--warning, #ffa726)';
-}
-
-$('btnIdfConfig').addEventListener('click', async () => {
-    $('modalIdfConfig').style.display = 'flex';
-    await loadIdfConfig();
-});
-
-$('closeIdfConfig').addEventListener('click', () => $('modalIdfConfig').style.display = 'none');
-$('cancelIdfConfig').addEventListener('click', () => $('modalIdfConfig').style.display = 'none');
-
-// 项目目录下拉框变化时同步到手动输入框
-$('cfgProjectDir').addEventListener('change', (e) => {
-    $('cfgProjectDirManual').value = e.target.value;
-});
-
-$('saveIdfConfig').addEventListener('click', async () => {
-    // 手动输入优先
-    const projectDir = $('cfgProjectDirManual').value.trim() || $('cfgProjectDir').value;
-    const exportScript = $('cfgIdfVersion').value;
-    const boardsDir = $('cfgBoardsDir').value.trim() || 'boards';
-    const board = $('cfgBoard').value.trim() || 'lckfb_szpi_esp32s3';
-
-    if (!projectDir) {
-        toast('请选择或输入项目目录', 'error');
-        return;
-    }
-
-    const statusEl = $('idfConfigStatus');
-    statusEl.textContent = '保存中...';
-
-    try {
-        const res = await fetch('/api/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                IDF_PROJECT_DIR: projectDir,
-                IDF_EXPORT_SCRIPT: exportScript,
-                IDF_BOARDS_DIR: boardsDir,
-                IDF_BOARD: board,
-            }),
-        });
-        const data = await res.json();
-        if (data.ok) {
-            toast('配置已保存并生效', 'success');
-            $('modalIdfConfig').style.display = 'none';
-        } else {
-            statusEl.textContent = '✗ ' + (data.error || data.message || '保存失败');
-            statusEl.style.color = 'var(--danger, #ef5350)';
-        }
-    } catch (e) {
-        statusEl.textContent = '✗ 请求失败: ' + e.message;
-        statusEl.style.color = 'var(--danger, #ef5350)';
-    }
 });
 
 // ============ 卡片折叠 ============
