@@ -621,7 +621,7 @@ async def ws_terminal(websocket: WebSocket, mode: str = "serial"):
             logger.info("终端断开 (serial)")
 
     elif mode == "shell":
-        # ---- Shell 模式（winpty）----
+        # ---- Shell 模式（winpty + PowerShell 直启动）----
         try:
             from winpty import PTY
         except ImportError:
@@ -631,27 +631,55 @@ async def ws_terminal(websocket: WebSocket, mode: str = "serial"):
             )
             return
 
-        # 启动 PTY — 用 cmd.exe，通过初始化命令设置环境
-        pty = PTY(120, 30)
-        shell_path = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
-        pty.spawn(shell_path)
+        # 构造干净环境：移除 MSYS/Mingw 变量，避免 ESP-IDF 报
+        # "MSys/Mingw is not supported"
+        spawn_env = os.environ.copy()
+        for k in ("MSYSTEM", "MSYSTEM_CHOST", "MSYSTEM_PREFIX", "MINGW_CHOST",
+                   "MINGW_PREFIX", "MINGW_PACKAGE_PREFIX"):
+            spawn_env.pop(k, None)
 
-        # 发送初始化命令：source ESP-IDF + cd 项目目录
-        init_cmds = []
-        export_script = os.getenv("IDF_EXPORT_SCRIPT", "")
+        # 用 PowerShell 直接启动（不经过 cmd.exe 嵌套，避免输出交错）
+        pty = PTY(120, 30)
+        powershell_path = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
         project_dir = os.getenv("IDF_PROJECT_DIR", "")
+        export_script = os.getenv("IDF_EXPORT_SCRIPT", "")
+
+        try:
+            pty.spawn(
+                powershell_path,
+                cmdline=f'"{powershell_path}" -NoProfile -NoLogo -NoExit',
+                cwd=project_dir if project_dir and os.path.isdir(project_dir) else None,
+            )
+        except Exception as e:
+            await websocket.send_text(f"[bridge] PTY 启动失败: {e}\r\n")
+            return
+
+        # 等待 PowerShell 完成启动
+        import time
+        time.sleep(1.5)
+
+        # 初始化命令（PowerShell 语法），每条之间留间隔确保执行
+        init_cmds = [
+            # 设置 UTF-8 编码，解决中文乱码
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8",
+            "$OutputEncoding = [System.Text.Encoding]::UTF8",
+            # 清除 MSYS/Mingw 环境变量（ESP-IDF export.ps1 会检测）
+            "Remove-Item Env:MSYSTEM -ErrorAction SilentlyContinue",
+            "Remove-Item Env:MSYSTEM_CHOST -ErrorAction SilentlyContinue",
+            "Remove-Item Env:MSYSTEM_PREFIX -ErrorAction SilentlyContinue",
+        ]
 
         if export_script and os.path.isfile(export_script):
-            # 用 powershell 加载 export 脚本，再切回 cmd
-            init_cmds.append(
-                f'powershell -NoProfile -Command ". \'{export_script}\'"'
-            )
-        if project_dir and os.path.isdir(project_dir):
-            init_cmds.append(f'cd /d "{project_dir}"')
+            init_cmds.append(f". '{export_script}'")
 
-        init_cmds.append("echo [bridge] Shell 终端就绪，IDF 环境已加载")
-        for cmd in init_cmds:
+        init_cmds.append(
+            "Write-Host '[bridge] Shell 终端就绪，IDF 环境已加载' -ForegroundColor Green"
+        )
+
+        for i, cmd in enumerate(init_cmds):
             pty.write(cmd + "\r\n")
+            # 每条命令之间间隔 0.5s，确保 PowerShell 有时间执行
+            time.sleep(0.5)
 
         # 后台线程：持续读取 PTY 输出 → 推到 WS
         pty_running = True
