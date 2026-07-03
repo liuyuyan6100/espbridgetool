@@ -59,6 +59,9 @@ STATUS_DISCONNECTED = "disconnected"
 STATUS_CONNECTED = "connected"
 STATUS_FLASHING = "flashing"
 
+# 主事件循环引用（在 lifespan 中捕获，供跨线程调度使用）
+MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
 
 def _on_serial_data(data: bytes):
     """串口数据回调：写入日志缓冲并广播到所有 WebSocket 客户端"""
@@ -73,14 +76,13 @@ def _on_serial_data(data: bytes):
 
 
 def _broadcast_task(text: str):
-    """将广播任务延迟到事件循环中执行"""
-    import asyncio
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.ensure_future(_broadcast(text))
-    except RuntimeError:
-        pass
+    """将广播任务安全地调度到主事件循环（线程安全版）"""
+    global MAIN_LOOP
+    if MAIN_LOOP and MAIN_LOOP.is_running():
+        try:
+            asyncio.run_coroutine_threadsafe(_broadcast(text), MAIN_LOOP)
+        except Exception:
+            pass
 
 
 async def _broadcast(text: str):
@@ -96,13 +98,14 @@ async def _broadcast(text: str):
             WS_CLIENTS.remove(ws)
 
 
-SERIAL = SerialManager(on_data=_on_serial_data)
-
-
 def _idf_output_callback(line: str):
     """idf.py 输出回调：推送到日志缓冲 + WebSocket"""
     BUFFER.append(line)
     _broadcast_task(f"[idf.py] {line}")
+
+
+# 注册串口数据回调（在 SERIAL 创建后立即注册）
+SERIAL.add_callback(_on_serial_data)
 
 
 # ---- FastAPI App ----
@@ -112,6 +115,8 @@ STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global MAIN_LOOP
+    MAIN_LOOP = asyncio.get_running_loop()
     logger.info("Serial Bridge 服务启动")
     # 自动打开串口（如果配置了）
     auto_port = os.getenv("SERIAL_PORT", "")
@@ -539,13 +544,18 @@ async def ws_log(websocket: WebSocket):
 
     try:
         while True:
-            data = await websocket.receive_text()
-            if data.startswith("/send "):
-                cmd = data[6:]
-                try:
-                    SERIAL.send_line(cmd)
-                except RuntimeError as e:
-                    await websocket.send_text(f"[bridge] 发送失败: {e}")
+            data = await websocket.receive()
+            msg_type = data.get("type", "")
+            if msg_type == "websocket.disconnect":
+                break
+            if "text" in data and data["text"] is not None:
+                text = data["text"]
+                if text.startswith("/send "):
+                    cmd = text[6:]
+                    try:
+                        SERIAL.send_line(cmd)
+                    except RuntimeError as e:
+                        await websocket.send_text(f"[bridge] 发送失败: {e}")
     except WebSocketDisconnect:
         pass
     finally:
@@ -557,7 +567,7 @@ async def ws_log(websocket: WebSocket):
 # ---- 终端 WebSocket（方案 3：xterm.js 全终端）----
 
 def _make_terminal_callback(ws: WebSocket, loop: asyncio.AbstractEventLoop):
-    """创建一个串口数据回调，把原始 bytes 推给指定终端 WS"""
+    """创建一个串口数据回调，把原始 bytes 推给指定终端 WS（线程安全版）"""
     async def _push(data: bytes):
         try:
             await ws.send_bytes(data)
@@ -566,7 +576,10 @@ def _make_terminal_callback(ws: WebSocket, loop: asyncio.AbstractEventLoop):
 
     def callback(data: bytes):
         if loop.is_running():
-            asyncio.ensure_future(_push(data), loop=loop)
+            try:
+                asyncio.run_coroutine_threadsafe(_push(data), loop)
+            except Exception:
+                pass
     return callback
 
 
@@ -578,7 +591,7 @@ async def ws_terminal(websocket: WebSocket, mode: str = "serial"):
     GET /ws/terminal?mode=shell   —— Shell 终端（执行 idf.py 等命令）
     """
     await websocket.accept()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     logger.info(f"终端连接: mode={mode}")
 
     if mode == "serial":
@@ -592,14 +605,17 @@ async def ws_terminal(websocket: WebSocket, mode: str = "serial"):
         try:
             while True:
                 msg = await websocket.receive()
-                if "bytes" in msg:
+                msg_type = msg.get("type", "")
+                if msg_type == "websocket.disconnect":
+                    break
+                if "bytes" in msg and msg["bytes"] is not None:
                     SERIAL.send(msg["bytes"])
-                elif "text" in msg:
+                elif "text" in msg and msg["text"] is not None:
                     SERIAL.send(msg["text"].encode("utf-8"))
         except WebSocketDisconnect:
             pass
         except Exception as e:
-            logger.warning(f"终端异常: {e}")
+            logger.warning(f"终端异常 (serial): {e}")
         finally:
             SERIAL.remove_callback(cb)
             logger.info("终端断开 (serial)")
@@ -645,11 +661,13 @@ async def ws_terminal(websocket: WebSocket, mode: str = "serial"):
                 try:
                     data = pty.read()
                     if data:
-                        # data 是 str，转成 bytes 推给 WS
                         if loop.is_running():
-                            asyncio.ensure_future(
-                                _send_pty_data(websocket, data), loop=loop
-                            )
+                            try:
+                                asyncio.run_coroutine_threadsafe(
+                                    _send_pty_data(websocket, data), loop
+                                )
+                            except Exception:
+                                break
                 except Exception:
                     break
                 import time
@@ -670,14 +688,17 @@ async def ws_terminal(websocket: WebSocket, mode: str = "serial"):
         try:
             while True:
                 msg = await websocket.receive()
-                if "bytes" in msg:
+                msg_type = msg.get("type", "")
+                if msg_type == "websocket.disconnect":
+                    break
+                if "bytes" in msg and msg["bytes"] is not None:
                     pty.write(msg["bytes"].decode("utf-8", errors="replace"))
-                elif "text" in msg:
+                elif "text" in msg and msg["text"] is not None:
                     pty.write(msg["text"])
         except WebSocketDisconnect:
             pass
         except Exception as e:
-            logger.warning(f"终端异常: {e}")
+            logger.warning(f"终端异常 (shell): {e}")
         finally:
             pty_running = False
             try:

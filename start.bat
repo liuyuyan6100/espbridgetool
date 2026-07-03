@@ -6,8 +6,10 @@ echo   Serial Bridge - ESP32 Serial Proxy
 echo =======================================
 echo.
 
-:: Use venv if available
-if exist "venv\Scripts\python.exe" (
+:: Use .venv if available, fall back to venv, then system python
+if exist ".venv\Scripts\python.exe" (
+    set PYTHON=.venv\Scripts\python.exe
+) else if exist "venv\Scripts\python.exe" (
     set PYTHON=venv\Scripts\python.exe
 ) else (
     set PYTHON=python
