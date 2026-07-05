@@ -1,0 +1,118 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 560" width="100%" height="auto">
+  <title>ESP32 Serial Bridge 远程接入架构</title>
+  <desc>云 Agent 通过 HTTPS+Bearer token 接入 MCP Hub，Hub 路由到本机和远程两个 serial_bridge 设备</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M2 1 L8 5 L2 9" fill="none" stroke="#5A5A5A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <filter id="shadow" x="-5%" y="-5%" width="110%" height="110%">
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#000000" flood-opacity="0.08"/>
+    </filter>
+    <style>
+      .title { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 14px; font-weight: 600; }
+      .subtitle { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 12px; font-weight: 400; fill: #5A5A5A; }
+      .label { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 11px; font-weight: 500; fill: #5A5A5A; }
+      .layer-label { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 12px; font-weight: 500; fill: #6B6B6B; }
+    </style>
+  </defs>
+
+  <!-- Layer labels -->
+  <text class="layer-label" x="40" y="28">客户端层（云端）</text>
+  <text class="layer-label" x="40" y="138">MCP Hub · 可部署公网 / 内网穿透</text>
+  <text class="layer-label" x="40" y="385">设备层</text>
+
+  <!-- Client: Agent A -->
+  <g filter="url(#shadow)">
+    <rect x="120" y="42" width="190" height="72" rx="10" fill="#E8F4FD" stroke="#1D6FA5" stroke-width="1"/>
+    <text class="title" x="215" y="66" text-anchor="middle" fill="#0C4A6E">云 Agent A</text>
+    <text class="subtitle" x="215" y="86" text-anchor="middle">WorkBuddy / Cursor</text>
+    <text class="subtitle" x="215" y="102" text-anchor="middle">(spawn stdio / HTTPS)</text>
+  </g>
+
+  <!-- Client: Agent B -->
+  <g filter="url(#shadow)">
+    <rect x="490" y="42" width="190" height="72" rx="10" fill="#E8F4FD" stroke="#1D6FA5" stroke-width="1"/>
+    <text class="title" x="585" y="66" text-anchor="middle" fill="#0C4A6E">云 Agent B</text>
+    <text class="subtitle" x="585" y="86" text-anchor="middle">其他 MCP 客户端</text>
+    <text class="subtitle" x="585" y="102" text-anchor="middle">(HTTPS)</text>
+  </g>
+
+  <!-- Hub outer container -->
+  <g filter="url(#shadow)">
+    <rect x="40" y="148" width="720" height="210" rx="18" fill="#F3F0FF" stroke="#5B4DB7" stroke-width="1"/>
+    <text class="title" x="400" y="176" text-anchor="middle" fill="#3C3489">mcp_server · streamable-http transport</text>
+  </g>
+
+  <!-- Hub inner: Bearer auth -->
+  <g filter="url(#shadow)">
+    <rect x="80" y="196" width="280" height="56" rx="8" fill="#FDF2EC" stroke="#B85C3D" stroke-width="1"/>
+    <text class="title" x="220" y="228" text-anchor="middle" fill="#7A2E18">Bearer token 鉴权</text>
+  </g>
+
+  <!-- Hub inner: Device routing -->
+  <g filter="url(#shadow)">
+    <rect x="440" y="196" width="280" height="56" rx="8" fill="#E6E1FC" stroke="#5B4DB7" stroke-width="1"/>
+    <text class="title" x="580" y="228" text-anchor="middle" fill="#3C3489">Device 路由</text>
+  </g>
+
+  <!-- Hub inner: ACL -->
+  <g filter="url(#shadow)">
+    <rect x="80" y="276" width="640" height="64" rx="8" fill="#FDF2EC" stroke="#B85C3D" stroke-width="1"/>
+    <text class="title" x="400" y="302" text-anchor="middle" fill="#7A2E18">ACL: token → 可操作设备</text>
+    <text class="subtitle" x="400" y="324" text-anchor="middle">token-A → 设备A · token-B → 设备A+B</text>
+  </g>
+
+  <!-- Bridge A -->
+  <g filter="url(#shadow)">
+    <rect x="120" y="405" width="190" height="72" rx="10" fill="#EAF8F2" stroke="#1A7A5C" stroke-width="1"/>
+    <text class="title" x="215" y="429" text-anchor="middle" fill="#064E3B">serial_bridge A</text>
+    <text class="subtitle" x="215" y="449" text-anchor="middle">本机 127.0.0.1:8080</text>
+    <text class="subtitle" x="215" y="465" text-anchor="middle">(HTTP + service token)</text>
+  </g>
+
+  <!-- ESP32 A -->
+  <g filter="url(#shadow)">
+    <rect x="145" y="500" width="140" height="42" rx="8" fill="#F5F5F0" stroke="#6B6B6B" stroke-width="1"/>
+    <text class="title" x="215" y="526" text-anchor="middle" fill="#2C2C2A">ESP32-A · COM6</text>
+  </g>
+
+  <!-- Bridge B -->
+  <g filter="url(#shadow)">
+    <rect x="490" y="405" width="190" height="72" rx="10" fill="#EAF8F2" stroke="#1A7A5C" stroke-width="1"/>
+    <text class="title" x="585" y="429" text-anchor="middle" fill="#064E3B">serial_bridge B</text>
+    <text class="subtitle" x="585" y="449" text-anchor="middle">远程 · via tunnel</text>
+    <text class="subtitle" x="585" y="465" text-anchor="middle">(HTTP + service token)</text>
+  </g>
+
+  <!-- ESP32 B -->
+  <g filter="url(#shadow)">
+    <rect x="515" y="500" width="140" height="42" rx="8" fill="#F5F5F0" stroke="#6B6B6B" stroke-width="1"/>
+    <text class="title" x="585" y="526" text-anchor="middle" fill="#2C2C2A">ESP32-B · COM3</text>
+  </g>
+
+  <!-- Connection: Agent A -> Hub -->
+  <line x1="215" y1="114" x2="215" y2="148" stroke="#5A5A5A" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <rect x="228" y="120" width="96" height="20" rx="4" fill="#F3F0FF" stroke="#5B4DB7" stroke-width="0.5"/>
+  <text class="label" x="276" y="134" text-anchor="middle" fill="#3C3489">HTTPS + Bearer</text>
+
+  <!-- Connection: Agent B -> Hub -->
+  <line x1="585" y1="114" x2="585" y2="148" stroke="#5A5A5A" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <rect x="598" y="120" width="96" height="20" rx="4" fill="#F3F0FF" stroke="#5B4DB7" stroke-width="0.5"/>
+  <text class="label" x="646" y="134" text-anchor="middle" fill="#3C3489">HTTPS + Bearer</text>
+
+  <!-- Connection: Hub -> Bridge A -->
+  <line x1="215" y1="358" x2="215" y2="405" stroke="#5A5A5A" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <rect x="228" y="370" width="118" height="20" rx="4" fill="#EAF8F2" stroke="#1A7A5C" stroke-width="0.5"/>
+  <text class="label" x="287" y="384" text-anchor="middle" fill="#064E3B">HTTP + service token</text>
+
+  <!-- Connection: Hub -> Bridge B -->
+  <line x1="585" y1="358" x2="585" y2="405" stroke="#5A5A5A" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <rect x="450" y="370" width="108" height="20" rx="4" fill="#EAF8F2" stroke="#1A7A5C" stroke-width="0.5"/>
+  <text class="label" x="504" y="384" text-anchor="middle" fill="#064E3B">HTTP via tunnel</text>
+
+  <!-- Connection: Bridge A -> ESP32 A -->
+  <line x1="215" y1="477" x2="215" y2="500" stroke="#6B6B6B" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+
+  <!-- Connection: Bridge B -> ESP32 B -->
+  <line x1="585" y1="477" x2="585" y2="500" stroke="#6B6B6B" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+</svg>

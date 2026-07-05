@@ -1,8 +1,12 @@
-"""日志环形缓冲 — 保存最近 N 行日志，支持过滤和回看"""
+"""日志环形缓冲 — 保存最近 N 行日志，支持过滤和回看
+
+支持基于序列号的增量获取（get_after_seq），用于 MCP agent
+"发命令后等待并收集新日志"的场景，避免重复读取历史。
+"""
 
 import re
 from collections import deque
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 
 class LogBuffer:
@@ -16,12 +20,41 @@ class LogBuffer:
         self._buffer: deque[str] = deque(maxlen=max_lines)
         # 原始数据（用于 WebSocket 恢复，含不可见字符）
         self._raw_buffer: deque[bytes] = deque(maxlen=max_lines)
+        # 全局递增序列号：每 append 一行 +1，用于增量获取
+        # 注意：deque 是环形的，满了会丢最早的行，但序列号始终递增
+        self._seq: int = 0
+        self._line_seqs: deque[int] = deque(maxlen=max_lines)
 
     def append(self, line: str, raw: Optional[bytes] = None) -> None:
         """追加一行日志"""
+        self._seq += 1
         self._buffer.append(line)
+        self._line_seqs.append(self._seq)
         if raw:
             self._raw_buffer.append(raw)
+
+    def get_after_seq(self, seq: int) -> Tuple[List[str], int]:
+        """获取序列号严格大于 seq 的所有日志行
+
+        用于增量获取场景（如 MCP agent 发命令后收集响应）。
+        即使环形缓冲已满、早期行被丢弃，也只返回 seq 之后的新行。
+
+        Returns:
+            (lines, latest_seq): 新行列表 + 当前最新序列号
+        """
+        result: List[str] = []
+        latest = seq
+        for line, s in zip(self._buffer, self._line_seqs):
+            if s > seq:
+                result.append(line)
+                if s > latest:
+                    latest = s
+        return result, latest
+
+    @property
+    def last_seq(self) -> int:
+        """当前最新序列号（初始为 0，表示无日志）"""
+        return self._seq
 
     def get_history(self, last_n: int = 100) -> List[str]:
         """获取最近 N 行历史日志"""

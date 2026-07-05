@@ -59,6 +59,49 @@ class IdfTool:
             return self.boards_dir
         return os.path.join(self.project_dir, self.boards_dir)
 
+    def _detect_python_env(self) -> Optional[str]:
+        """自动检测 ESP-IDF 的 Python 虚拟环境路径。
+
+        export.ps1 会按系统 Python 版本去找 C:\\Espressif\\python_env\\idf5.5_py3.X_env，
+        但系统 Python 版本可能和 IDF 安装时的版本不一致（比如 IDF 装时是 3.13，
+        后来系统降级或装了多个 Python）。这里直接扫目录，按 export_script 路径里
+        的 IDF 版本号匹配对应环境，绕过 export.ps1 的版本检测。
+
+        Returns:
+            Python 环境目录绝对路径，找不到返回 None。
+        """
+        # 从 export_script 路径提取 IDF 版本号（如 v5.5.4 → 5.5）
+        idf_ver = None
+        m = re.search(r'[v/](\d+\.\d+)', self.export_script)
+        if m:
+            idf_ver = m.group(1)  # "5.5"
+
+        candidates = [
+            r"C:\Espressif\python_env",
+            os.path.join(os.path.dirname(os.path.dirname(self.export_script)), "python_env"),
+        ]
+        for base in candidates:
+            if not os.path.isdir(base):
+                continue
+            # 找 idf*_py*_env 目录
+            dirs = [d for d in os.listdir(base)
+                    if d.startswith("idf") and d.endswith("_env") and "_py" in d]
+            # 优先匹配 IDF 版本号（如 idf5.5_py3.13_env）
+            if idf_ver:
+                prefix = f"idf{idf_ver}_"
+                matched = [d for d in dirs if d.startswith(prefix)]
+                if matched:
+                    for name in matched:
+                        path = os.path.join(base, name)
+                        if os.path.exists(os.path.join(path, "Scripts", "python.exe")):
+                            return path
+            # 版本号没匹配上，取最后一个（版本号最大的，sorted 后最后一个）
+            for name in sorted(dirs, reverse=True):
+                path = os.path.join(base, name)
+                if os.path.exists(os.path.join(path, "Scripts", "python.exe")):
+                    return path
+        return None
+
     def _run_cmd(
         self,
         cmd: list,
@@ -76,11 +119,20 @@ class IdfTool:
         export_escaped = self.export_script.replace("'", "''")
         idf_args = " ".join(cmd)
 
+        # 自动检测 IDF Python 环境路径，绕过 export.ps1 的版本检测
+        # （系统 Python 版本可能和 IDF 安装时的版本不一致）
+        py_env = self._detect_python_env()
+        py_env_clause = ""
+        if py_env:
+            py_env_escaped = py_env.replace("'", "''")
+            py_env_clause = f"$env:IDF_PYTHON_ENV_PATH='{py_env_escaped}'; "
+
         # 用脚本块包裹，确保环境变量在同一个作用域内生效
         ps_script = (
             f"$env:PYTHONUTF8='1'; "
             f"$env:PYTHONIOENCODING='utf-8'; "
             f"$env:ESP_BMGR_LOCK_TIMEOUT='120'; "
+            f"{py_env_clause}"
             f". '{export_escaped}'; "
             f"idf.py {idf_args}"
         )
@@ -90,6 +142,8 @@ class IdfTool:
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
         env["ESP_BMGR_LOCK_TIMEOUT"] = "120"
+        if py_env:
+            env["IDF_PYTHON_ENV_PATH"] = py_env
         if env_extra:
             env.update(env_extra)
 

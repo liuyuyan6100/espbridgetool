@@ -27,14 +27,34 @@ if not exist ".env" (
     )
 )
 
+:: Auto-detect ESP32 serial port if SERIAL_PORT not set or port unavailable
+:: This helps when USB re-enumeration changes COM port number
+%PYTHON% -c "import serial.tools.list_ports as lp; ports=[p for p in lp.comports() if 'USB' in (p.hwid or '') or 'CH340' in (p.description or '') or 'CP210' in (p.description or '') or 'JTAG' in (p.description or '')]; print(ports[0].device if ports else '', end='')" > "%TEMP%\esp_port.txt" 2>nul
+set /p DETECTED_PORT= < "%TEMP%\esp_port.txt"
+del "%TEMP%\esp_port.txt" 2>nul
+
+if defined DETECTED_PORT (
+    if not "%DETECTED_PORT%"=="" (
+        echo [INFO] Detected ESP32 serial port: %DETECTED_PORT%
+    )
+)
+
 echo Config: .env
 echo Web UI: http://127.0.0.1:8080
+echo MCP:    Configure mcp_server.py in your agent (TRAE/Cursor/Claude)
+echo.
+echo =======================================
+echo  Auto-recovery enabled:
+echo  - USB hot-plug detection
+echo  - Dynamic port tracking (COM6 ^<-^> COM5)
+echo  - Flash retry with 8 attempts
+echo =======================================
 echo.
 
 %PYTHON% serial_bridge.py
 
-if %ERRORLEVEL% neq 0 (
-    echo.
-    echo [ERROR] Server exited with code: %ERRORLEVEL%
-    pause
-)
+echo.
+echo [INFO] Server stopped (exit code: %ERRORLEVEL%).
+echo.
+echo Press any key to close...
+pause >nul

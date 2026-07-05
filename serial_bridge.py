@@ -24,6 +24,7 @@ from pydantic import BaseModel
 
 from serial_manager import SerialManager
 from log_buffer import LogBuffer
+from log_sink import LogSink
 from idf_tool import IdfTool
 
 # ---- 加载 .env 配置 ----
@@ -44,6 +45,14 @@ logger = logging.getLogger("serial_bridge")
 SERIAL = SerialManager(on_data=None)
 BUFFER = LogBuffer(max_lines=int(os.getenv("LOG_MAX_LINES", "10000")))
 IDF: Optional[IdfTool] = None
+
+# 日志落盘（会话级文件）。LOG_SINK_ENABLED=false 可关闭。
+# 默认目录 logs/（相对本文件所在目录），可经 LOG_SINK_DIR 用绝对路径覆盖。
+_SINK_DIR = os.getenv("LOG_SINK_DIR", os.path.join(os.path.dirname(__file__), "logs"))
+SINK = LogSink(
+    sink_dir=_SINK_DIR,
+    enabled=os.getenv("LOG_SINK_ENABLED", "true").lower() in ("1", "true", "yes", "on"),
+)
 
 # WebSocket 连接池
 WS_CLIENTS: List[WebSocket] = []
@@ -72,6 +81,7 @@ def _on_serial_data(data: bytes):
         text = repr(data)
 
     BUFFER.append(text, raw=data)
+    SINK.write(text)
     _broadcast_task(text)
 
 
@@ -101,6 +111,7 @@ async def _broadcast(text: str):
 def _idf_output_callback(line: str):
     """idf.py 输出回调：推送到日志缓冲 + WebSocket"""
     BUFFER.append(line)
+    SINK.write(f"[idf.py] {line}")
     _broadcast_task(f"[idf.py] {line}")
 
 
@@ -118,6 +129,19 @@ async def lifespan(app: FastAPI):
     global MAIN_LOOP
     MAIN_LOOP = asyncio.get_running_loop()
     logger.info("Serial Bridge 服务启动")
+    # 开启日志落盘会话（写环境元数据到文件头）
+    if SINK.enabled:
+        auto_port = os.getenv("SERIAL_PORT", "")
+        auto_baud = int(os.getenv("SERIAL_BAUD", "115200"))
+        sink_path = SINK.open_session(meta={
+            "串口": auto_port or "(未配置)",
+            "波特率": auto_baud,
+            "IDF 项目目录": os.getenv("IDF_PROJECT_DIR", "(未配置)"),
+            "IDF 板型": os.getenv("IDF_BOARD", "(未配置)"),
+            "日志缓冲行数": os.getenv("LOG_MAX_LINES", "10000"),
+        })
+        if sink_path:
+            logger.info(f"日志落盘已启用: {sink_path}")
     # 自动打开串口（如果配置了）
     auto_port = os.getenv("SERIAL_PORT", "")
     auto_baud = int(os.getenv("SERIAL_BAUD", "115200"))
@@ -130,6 +154,7 @@ async def lifespan(app: FastAPI):
     yield
     if SERIAL.is_open:
         SERIAL.close()
+    SINK.close()
     logger.info("Serial Bridge 服务关闭")
 
 
@@ -142,6 +167,29 @@ app = FastAPI(
 
 # 挂载静态文件目录（CSS/JS 等）
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+# ---- 内层 token 鉴权中间件（可选）----
+# 配置 BRIDGE_AUTH_TOKEN 后，除 / 和 /static 外的 /api/* 和 /ws/* 请求
+# 必须带 X-Bridge-Token 头。防止 bridge 被未授权直连。
+# 留空（默认）则不校验，保持向后兼容。
+BRIDGE_AUTH_TOKEN = os.getenv("BRIDGE_AUTH_TOKEN", "")
+
+
+@app.middleware("http")
+async def bridge_auth_middleware(request, call_next):
+    """校验 X-Bridge-Token 头（仅当 BRIDGE_AUTH_TOKEN 已配置时生效）"""
+    if BRIDGE_AUTH_TOKEN:
+        path = request.url.path
+        # 放行：根路径（Web UI 首页）、静态资源、健康检查
+        if path in ("/", "/health") or path.startswith("/static"):
+            return await call_next(request)
+        token = request.headers.get("X-Bridge-Token", "")
+        if token != BRIDGE_AUTH_TOKEN:
+            return JSONResponse(
+                {"ok": False, "error": "无效或缺失的 X-Bridge-Token"},
+                status_code=401,
+            )
+    return await call_next(request)
 
 
 # ---- REST API ----
@@ -212,11 +260,177 @@ async def api_log_history(
     return {"lines": BUFFER.get_history(last_n=lines)}
 
 
+@app.get("/api/log/since")
+async def api_log_since(seq: int = Query(0, description="返回此序列号之后的日志")):
+    """增量获取日志（基于序列号）
+
+    供 MCP agent 轮询新日志使用。返回序列号严格大于 seq 的所有行。
+    """
+    new_lines, latest = BUFFER.get_after_seq(seq)
+    return {"ok": True, "lines": new_lines, "before_seq": seq, "after_seq": latest}
+
+
+@app.get("/api/log/last-seq")
+async def api_log_last_seq():
+    """获取当前最新序列号"""
+    return {"ok": True, "last_seq": BUFFER.last_seq, "count": BUFFER.count}
+
+
+@app.post("/api/send-and-collect")
+async def api_send_and_collect(data: dict):
+    """发送串口命令并等待收集设备响应
+
+    典型场景：AI agent 发送 AT 命令或 shell 指令后，需要看到设备
+    在一段时间内的输出作为"反馈"，而不是盲猜。
+
+    参数:
+        cmd: 要发送的命令文本
+        hex: 是否以 HEX 模式发送（默认 False）
+        wait: 发送后等待收集的秒数（0.1~10，默认 2.0）
+
+    返回:
+        ok, sent_bytes, cmd, wait_seconds, before_seq, after_seq,
+        collected_lines: 等待期间新增的日志行列表
+    """
+    cmd = data.get("cmd", "")
+    hex_mode = data.get("hex", False)
+    wait_seconds = float(data.get("wait", 2.0))
+    # 限制最大等待时间，避免 agent 把服务卡死
+    wait_seconds = min(max(wait_seconds, 0.1), 10.0)
+
+    if not cmd:
+        return JSONResponse({"ok": False, "error": "缺少 cmd 参数"}, status_code=400)
+
+    if not SERIAL.is_open:
+        return JSONResponse(
+            {"ok": False, "error": "串口未打开，请先调用 open_serial"}, status_code=400
+        )
+
+    before_seq = BUFFER.last_seq
+
+    try:
+        if hex_mode:
+            hex_str = cmd.replace(" ", "").replace("\n", "")
+            data_bytes = bytes.fromhex(hex_str)
+            n = SERIAL.send(data_bytes)
+        else:
+            n = SERIAL.send_line(cmd)
+        STATS["tx_bytes"] += n
+    except RuntimeError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": f"HEX 格式错误: {e}"}, status_code=400)
+
+    await asyncio.sleep(wait_seconds)
+
+    new_lines, after_seq = BUFFER.get_after_seq(before_seq)
+    return {
+        "ok": True,
+        "sent_bytes": n,
+        "cmd": cmd.strip(),
+        "wait_seconds": wait_seconds,
+        "before_seq": before_seq,
+        "after_seq": after_seq,
+        "collected_lines": new_lines,
+    }
+
+
 @app.post("/api/log/clear")
 async def api_log_clear():
     """清空日志缓冲"""
     BUFFER.clear()
     return {"ok": True}
+
+
+# ---- 日志落盘（会话级文件）----
+
+@app.get("/api/log/sessions")
+async def api_log_sessions():
+    """列出所有落盘会话文件（按修改时间倒序）。
+
+    返回每个会话的 path、size、mtime。当前活跃会话标 current=true。
+    """
+    sessions = SINK.list_sessions()
+    import os.path as _p
+    from datetime import datetime as _dt
+    result = []
+    for path in sessions:
+        try:
+            st = os.stat(path)
+            result.append({
+                "path": path,
+                "name": _p.basename(path),
+                "size": st.st_size,
+                "mtime": _dt.fromtimestamp(st.st_mtime).isoformat(),
+                "current": (path == SINK.current_path),
+            })
+        except OSError:
+            continue
+    return {"ok": True, "enabled": SINK.enabled, "sessions": result,
+            "current": SINK.current_path}
+
+
+@app.post("/api/log/dump")
+async def api_log_dump(data: dict = None):
+    """把当前内存缓冲导出为一个文件（可选指定路径）。
+
+    参数:
+        path: 可选，目标文件绝对路径。不传则导出到落盘目录下，
+              文件名 dump_<时间戳>.log。
+        lines: 可选，导出最近 N 行，默认全部。
+
+    与会话文件的区别：会话文件是持续追加的实时流；dump 是某一时刻的
+    内存缓冲快照，适合"现在这一段日志我要单独存下来分析"。
+    """
+    if data is None:
+        data = {}
+    target = data.get("path")
+    lines_n = data.get("lines")
+    if lines_n:
+        try:
+            lines_n = int(lines_n)
+        except (TypeError, ValueError):
+            lines_n = None
+    content_lines = BUFFER.get_history(last_n=lines_n) if lines_n else BUFFER.get_history(last_n=BUFFER.max_lines)
+    content = "\n".join(content_lines)
+    if not content_lines:
+        content = "(空缓冲)"
+
+    if not target:
+        os.makedirs(_SINK_DIR, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_") + f"{datetime.now().microsecond // 1000:03d}"
+        import secrets as _sec
+        target = os.path.join(_SINK_DIR, f"dump_{ts}_{_sec.token_hex(2)}.log")
+    try:
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(f"=== Serial Bridge 日志导出 ===\n")
+            f.write(f"导出时间: {datetime.now().isoformat()}\n")
+            f.write(f"行数: {len(content_lines)}\n")
+            f.write("=" * 40 + "\n")
+            f.write(content)
+            f.write("\n")
+        return {"ok": True, "path": target, "lines": len(content_lines)}
+    except OSError as e:
+        return JSONResponse({"ok": False, "error": f"写入失败: {e}"}, status_code=500)
+
+
+@app.post("/api/log/rotate")
+async def api_log_rotate():
+    """轮转落盘会话：关闭当前文件，开启新会话文件。
+
+    用于人为切分调试阶段——比如"开始测 WiFi"前 rotate 一下，
+    新阶段日志进新文件，便于事后按阶段回看。
+    """
+    if not SINK.enabled:
+        return {"ok": False, "error": "日志落盘未启用"}
+    path = SINK.rotate(meta={
+        "轮转时间": datetime.now().isoformat(),
+        "串口": SERIAL.port or "(未连接)",
+        "波特率": SERIAL.baud,
+    })
+    if path:
+        return {"ok": True, "path": path}
+    return {"ok": False, "error": "会话文件创建失败"}
 
 
 @app.post("/api/stats/reset")
