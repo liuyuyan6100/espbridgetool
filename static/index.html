@@ -141,6 +141,23 @@
             </div>
         </div>
 
+        <!-- 烧录进度条 -->
+        <div class="flash-progress-container" id="flashProgressContainer" style="display:none;">
+            <div class="flash-progress-info">
+                <span class="flash-progress-phase" id="flashPhase">烧录中</span>
+                <span class="flash-progress-message" id="flashMessage">准备中...</span>
+                <span class="flash-progress-percent" id="flashPercent">0%</span>
+            </div>
+            <div class="flash-progress-bar-bg">
+                <div class="flash-progress-bar-fill" id="flashBarFill" style="width:0%"></div>
+            </div>
+            <div class="flash-progress-meta">
+                <span id="flashAddr"></span>
+                <span id="flashPartitions"></span>
+                <span id="flashElapsed"></span>
+            </div>
+        </div>
+
         <!-- 日志显示区 -->
         <div class="log-view" id="logView"></div>
 

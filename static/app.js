@@ -29,6 +29,16 @@ function connectWs() {
     ws.onopen = () => { /* 无需额外操作 */ };
 
     ws.onmessage = (evt) => {
+        // 尝试解析 JSON（烧录进度事件），失败则当作普通日志
+        if (evt.data.startsWith('{')) {
+            try {
+                const msg = JSON.parse(evt.data);
+                if (msg.type === 'flash_progress' && msg.progress) {
+                    updateFlashProgress(msg.progress);
+                    return;
+                }
+            } catch (e) { /* 非 JSON，走普通日志 */ }
+        }
         appendLog(evt.data);
     };
 
@@ -636,6 +646,100 @@ document.querySelectorAll('#viewModeGroup .seg-btn').forEach(btn => {
     });
 });
 
+// ============ 烧录进度 ============
+
+const flashEls = {
+    container: document.getElementById('flashProgressContainer'),
+    phase: document.getElementById('flashPhase'),
+    message: document.getElementById('flashMessage'),
+    percent: document.getElementById('flashPercent'),
+    barFill: document.getElementById('flashBarFill'),
+    addr: document.getElementById('flashAddr'),
+    partitions: document.getElementById('flashPartitions'),
+    elapsed: document.getElementById('flashElapsed'),
+};
+
+const PHASE_LABELS = {
+    connecting: '连接中',
+    flashing: '烧录中',
+    resetting: '重启中',
+    done: '完成',
+    error: '失败',
+    building: '编译中',
+};
+
+let flashPollTimer = null;
+
+function updateFlashProgress(prog) {
+    if (!prog || !flashEls.container) return;
+
+    // active=true 或 phase 非 done/error 时显示进度条
+    const show = prog.active || prog.phase === 'done' || prog.phase === 'error';
+    flashEls.container.style.display = show ? 'block' : 'none';
+    if (!show) return;
+
+    const pct = prog.percent || 0;
+    flashEls.percent.textContent = pct + '%';
+    flashEls.barFill.style.width = pct + '%';
+    flashEls.message.textContent = prog.message || '';
+
+    const phaseLabel = PHASE_LABELS[prog.phase] || prog.phase || '';
+    flashEls.phase.textContent = phaseLabel;
+    flashEls.phase.className = 'flash-progress-phase phase-' + (prog.phase || '');
+
+    flashEls.barFill.className = 'flash-progress-bar-fill' +
+        (prog.phase === 'error' ? ' error' : '') +
+        (prog.phase === 'done' ? ' done' : '');
+
+    flashEls.addr.textContent = prog.address ? '地址: ' + prog.address : '';
+    flashEls.partitions.textContent = prog.written_partitions > 0
+        ? '分区: ' + prog.written_partitions : '';
+    flashEls.elapsed.textContent = prog.elapsed > 0
+        ? '耗时: ' + prog.elapsed + 's' : '';
+
+    // 完成或失败后停止轮询
+    if (!prog.active && flashPollTimer) {
+        clearTimeout(flashPollTimer);
+        flashPollTimer = null;
+        // 3 秒后自动隐藏完成/失败状态
+        if (prog.phase === 'done' || prog.phase === 'error') {
+            setTimeout(() => {
+                if (flashEls.container) flashEls.container.style.display = 'none';
+            }, 3000);
+        }
+    }
+}
+
+/** 轮询烧录进度（WebSocket 推送的兜底） */
+function pollFlashProgress() {
+    fetch('/api/flash/progress')
+        .then(r => r.json())
+        .then(data => {
+            if (data.active || data.phase === 'done' || data.phase === 'error') {
+                updateFlashProgress(data);
+            }
+            if (data.active) {
+                flashPollTimer = setTimeout(pollFlashProgress, 1000);
+            }
+        })
+        .catch(() => {});
+}
+
+// 监听 build/flash 按钮触发进度轮询（如果有这些按钮的话）
+// 兜底：每 2 秒检查一次是否在烧录
+setInterval(() => {
+    if (!flashPollTimer) {
+        fetch('/api/flash/progress')
+            .then(r => r.json())
+            .then(data => {
+                if (data.active) {
+                    pollFlashProgress();
+                }
+            })
+            .catch(() => {});
+    }
+}, 2000);
+
 // ============ 初始化 ============
 refreshPorts();
 updateStats();
@@ -643,4 +747,4 @@ loadQuickCommands();
 connectWs();
 setInterval(updateStats, 3000);
 
-console.log('Serial Bridge v1.3 已加载（含终端模式）');
+console.log('Serial Bridge v1.4 已加载（含烧录进度）');

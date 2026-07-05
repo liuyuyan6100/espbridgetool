@@ -102,22 +102,41 @@ def register(mcp: FastMCP) -> None:
         return bridge_client.fmt(bridge_client.call("POST", "/api/build", json=payload, timeout=600.0))
 
     @mcp.tool()
-    def flash(port: Optional[str] = None, board: Optional[str] = None) -> str:
-        """烧录固件到 ESP32（`idf.py -p <port> flash`）。
+    def flash(port: Optional[str] = None, board: Optional[str] = None, wait: bool = False) -> str:
+        """启动 ESP32 固件烧录（`idf.py -p <port> flash`）。
 
         参数:
             port: 串口号，如 "COM6"。不传则用当前已打开的串口或默认 COM6。
             board: 可选，指定板型会先 select_board 再 flash。
+            wait: 默认 False，立即返回后台任务 job_id；设 True 才阻塞等待烧录结束。
 
+        默认非阻塞，返回后请调用 get_flash_progress 轮询 active/percent/job_status/result。
         烧录前会自动释放串口（SerialManager 的 acquire_for_flash），烧完自动重连。
-        需先 build 成功。耗时通常 10~60 秒。
         """
-        payload = {}
+        payload = {"wait": wait}
         if port:
             payload["port"] = port
         if board:
             payload["board"] = board
-        return bridge_client.fmt(bridge_client.call("POST", "/api/flash", json=payload, timeout=300.0))
+        timeout = 300.0 if wait else 30.0
+        return bridge_client.fmt(bridge_client.call("POST", "/api/flash", json=payload, timeout=timeout))
+
+    @mcp.tool()
+    def get_flash_progress() -> str:
+        """查询烧录实时进度。
+
+        在 flash 工具执行期间或执行后调用，获取烧录百分比和状态。
+
+        返回:
+            active: 是否正在烧录
+            phase: 阶段 (connecting/flashing/resetting/done/error)
+            percent: 0-100 进度百分比
+            address: 当前写入地址 (如 0x00008000)
+            message: 状态消息
+            written_partitions: 已完成分区数
+            elapsed: 已耗时秒数
+        """
+        return bridge_client.fmt(bridge_client.call("GET", "/api/flash/progress"))
 
     @mcp.tool()
     def clean_build() -> str:

@@ -18,7 +18,7 @@ EXPECTED_TOOLS = {
     # idf
     "get_idf_config", "set_idf_config", "list_idf_versions",
     "list_idf_projects", "list_boards", "select_board",
-    "build", "flash", "clean_build",
+    "build", "flash", "get_flash_progress", "clean_build",
 }
 
 EXPECTED_RESOURCES = {
@@ -38,7 +38,7 @@ def test_register_all_registers_all_resources(fake_mcp):
 
 def test_register_all_tool_count(fake_mcp):
     register_all(fake_mcp)
-    assert len(fake_mcp.tools) == 22
+    assert len(fake_mcp.tools) == 23
 
 
 def test_register_all_resource_count(fake_mcp):

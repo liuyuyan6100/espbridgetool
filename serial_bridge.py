@@ -8,12 +8,14 @@
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sys
 import threading
+import time
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import uvicorn
 from dotenv import load_dotenv
@@ -71,6 +73,11 @@ STATUS_FLASHING = "flashing"
 # 主事件循环引用（在 lifespan 中捕获，供跨线程调度使用）
 MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
+# 烧录后台任务状态（保护 FastAPI 事件循环不被 idf.py flash 阻塞）
+FLASH_JOB_LOCK = threading.RLock()
+FLASH_JOB: Optional[Dict[str, Any]] = None
+FLASH_JOB_SEQ = 0
+
 
 def _on_serial_data(data: bytes):
     """串口数据回调：写入日志缓冲并广播到所有 WebSocket 客户端"""
@@ -108,11 +115,120 @@ async def _broadcast(text: str):
             WS_CLIENTS.remove(ws)
 
 
+def _bridge_log(line: str) -> None:
+    """写入 bridge 日志并线程安全广播。"""
+    BUFFER.append(line)
+    SINK.write(line)
+    _broadcast_task(line)
+
+
+def _broadcast_flash_progress() -> None:
+    """线程安全推送最新烧录进度。"""
+    if IDF is None:
+        return
+    prog = IDF.flash_progress.to_dict()
+    with FLASH_JOB_LOCK:
+        if FLASH_JOB:
+            prog.update({
+                "job_id": FLASH_JOB.get("job_id"),
+                "job_status": FLASH_JOB.get("status"),
+                "port": FLASH_JOB.get("port"),
+                "board": FLASH_JOB.get("board"),
+                "started_at": FLASH_JOB.get("started_at"),
+                "finished_at": FLASH_JOB.get("finished_at"),
+                "result": FLASH_JOB.get("result"),
+            })
+    _broadcast_task(json.dumps(
+        {"type": "flash_progress", "progress": prog},
+        ensure_ascii=False
+    ))
+
+
+def _next_flash_job_id() -> str:
+    global FLASH_JOB_SEQ
+    with FLASH_JOB_LOCK:
+        FLASH_JOB_SEQ += 1
+        return f"flash-{int(time.time())}-{FLASH_JOB_SEQ}"
+
+
+def _flash_job_snapshot() -> Dict[str, Any]:
+    with FLASH_JOB_LOCK:
+        return dict(FLASH_JOB) if FLASH_JOB else {}
+
+
+def _run_flash_job(job_id: str, port: str, board: Optional[str]) -> Tuple[bool, str]:
+    """在线程里执行阻塞烧录，避免阻塞 FastAPI 事件循环。"""
+    global FLASH_JOB
+    _bridge_log(f"[bridge] 开始后台烧录 job={job_id} port={port} board={board or '-'}")
+    with FLASH_JOB_LOCK:
+        if FLASH_JOB and FLASH_JOB.get("job_id") == job_id:
+            FLASH_JOB.update(status="running", active=True, started_at=time.time())
+
+    ok = False
+    output = ""
+    error = ""
+    try:
+        if IDF is None:
+            raise RuntimeError("IDF 工具未初始化，未设置项目目录")
+        with SERIAL.acquire_for_flash():
+            ok, output = IDF.flash(port=port, board=board)
+    except Exception as exc:  # 线程中要捕获，避免 job 状态丢失
+        logger.exception("后台烧录任务异常")
+        error = str(exc)
+        output = error
+        if IDF is not None:
+            IDF.flash_progress.finish(False)
+    finally:
+        status = "done" if ok else "error"
+        result = {
+            "ok": ok,
+            "output": output[:500] if not ok else "烧录完成",
+        }
+        if error:
+            result["error"] = error
+        with FLASH_JOB_LOCK:
+            if FLASH_JOB and FLASH_JOB.get("job_id") == job_id:
+                FLASH_JOB.update(
+                    active=False,
+                    status=status,
+                    finished_at=time.time(),
+                    result=result,
+                )
+        result_msg = f"[bridge] 烧录{'成功' if ok else '失败'} job={job_id}"
+        _bridge_log(result_msg)
+        _broadcast_flash_progress()
+    return ok, output
+
+
+_FLASH_LOG_STATE = {"percent": -1, "ts": 0.0}
+
+
 def _idf_output_callback(line: str):
-    """idf.py 输出回调：推送到日志缓冲 + WebSocket"""
+    """idf.py 输出回调：推送到日志缓冲 + WebSocket + 落盘
+
+    如果当前正在烧录，解析出的进度变化也会通过 WebSocket 推送。
+    """
     BUFFER.append(line)
     SINK.write(f"[idf.py] {line}")
     _broadcast_task(f"[idf.py] {line}")
+    # 烧录进度变化时额外推送进度事件
+    if IDF is not None and IDF.flash_progress.active:
+        prog = IDF.flash_progress.to_dict()
+        _broadcast_task(json.dumps(
+            {"type": "flash_progress", "progress": prog},
+            ensure_ascii=False
+        ))
+        # 节流打到控制台，让 bat 终端能看到烧录仍在推进
+        now = time.time()
+        percent = prog.get("percent", 0)
+        if (percent - _FLASH_LOG_STATE["percent"] >= 5
+                or now - _FLASH_LOG_STATE["ts"] >= 5):
+            _FLASH_LOG_STATE["percent"] = percent
+            _FLASH_LOG_STATE["ts"] = now
+            logger.info(
+                f"烧录进度: {percent}% "
+                f"{prog.get('address', '')} {prog.get('message', '')}"
+            )
 
 
 # 注册串口数据回调（在 SERIAL 创建后立即注册）
@@ -648,24 +764,99 @@ async def api_build(data: dict = {}):
 
 @app.post("/api/flash")
 async def api_flash(data: dict):
-    """触发烧录（自动管理串口释放与重连）"""
-    global IDF
+    """触发烧录（默认后台执行，可用 wait=true 兼容阻塞等待）。"""
+    global FLASH_JOB, IDF
     if IDF is None:
         return JSONResponse(
             {"ok": False, "error": "IDF 工具未初始化，未设置项目目录"},
             status_code=400,
         )
+
+    wait = bool(data.get("wait", False))
     port = data.get("port", SERIAL.port or "COM6")
     board = data.get("board")
 
-    with SERIAL.acquire_for_flash():
-        ok, output = IDF.flash(port=port, board=board)
+    with FLASH_JOB_LOCK:
+        if FLASH_JOB and FLASH_JOB.get("active"):
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "已有烧录任务正在执行",
+                    "job": dict(FLASH_JOB),
+                },
+                status_code=409,
+            )
+        job_id = _next_flash_job_id()
+        FLASH_JOB = {
+            "job_id": job_id,
+            "active": True,
+            "status": "queued",
+            "port": port,
+            "board": board,
+            "wait": wait,
+            "created_at": time.time(),
+            "started_at": None,
+            "finished_at": None,
+            "result": None,
+        }
 
-    result_msg = f"[bridge] 烧录{'成功' if ok else '失败'}"
-    BUFFER.append(result_msg)
-    await _broadcast(result_msg)
+    if wait:
+        loop = asyncio.get_running_loop()
+        ok, output = await loop.run_in_executor(None, _run_flash_job, job_id, port, board)
+        return {
+            "ok": ok,
+            "job_id": job_id,
+            "status": "done" if ok else "error",
+            "output": output[:500] if not ok else "烧录完成",
+        }
 
-    return {"ok": ok, "output": output[:500] if not ok else "烧录完成"}
+    thread = threading.Thread(
+        target=_run_flash_job,
+        args=(job_id, port, board),
+        name=f"idf-flash-{job_id}",
+        daemon=True,
+    )
+    thread.start()
+    return {
+        "ok": True,
+        "accepted": True,
+        "job_id": job_id,
+        "status": "queued",
+        "message": "烧录已在后台启动；调用 get_flash_progress 查询进度",
+    }
+
+
+# ---- 烧录进度 ----
+
+@app.get("/api/flash/progress")
+async def api_flash_progress():
+    """查询烧录进度
+
+    返回:
+        active: 是否正在烧录
+        phase: 阶段 (connecting/flashing/resetting/done/error)
+        percent: 0-100
+        address: 当前写入地址
+        message: 状态消息
+        written_partitions: 已完成分区数
+        elapsed: 已耗时秒数
+        job_id/job_status/result: 后台烧录任务元数据
+    """
+    if IDF is None:
+        return {"ok": True, "active": False, "message": "IDF 未初始化"}
+    progress = {"ok": True, **IDF.flash_progress.to_dict()}
+    job = _flash_job_snapshot()
+    if job:
+        progress.update({
+            "job_id": job.get("job_id"),
+            "job_status": job.get("status"),
+            "port": job.get("port"),
+            "board": job.get("board"),
+            "started_at": job.get("started_at"),
+            "finished_at": job.get("finished_at"),
+            "result": job.get("result"),
+        })
+    return progress
 
 
 @app.post("/api/clean")

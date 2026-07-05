@@ -8,6 +8,8 @@ import os
 import re
 import subprocess
 import logging
+import threading
+from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -17,6 +19,80 @@ DEFAULT_IDF_EXPORT_SCRIPT = r"C:\esp\v5.5.4\esp-idf\export.ps1"
 
 # 默认开发板（立创·实战派 ESP32-S3）
 DEFAULT_BOARD = "lckfb_szpi_esp32s3"
+
+
+@dataclass
+class FlashProgress:
+    """烧录进度状态（线程安全）"""
+    active: bool = False
+    phase: str = ""          # "building" / "flashing" / "done" / "error" / ""
+    percent: int = 0         # 0-100
+    address: str = ""        # 当前烧录地址（如 0x00008000）
+    message: str = ""        # 人类可读状态消息
+    total_partitions: int = 0  # 总分区数
+    written_partitions: int = 0  # 已完成分区数
+    started_at: Optional[float] = None  # 开始时间戳
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def reset(self, phase: str = "flashing") -> None:
+        with self._lock:
+            self.active = True
+            self.phase = phase
+            self.percent = 0
+            self.address = ""
+            self.message = "开始烧录"
+            self.total_partitions = 0
+            self.written_partitions = 0
+            import time
+            self.started_at = time.time()
+
+    def update(self, percent: int = -1, address: str = "", message: str = "",
+               phase: str = "", inc_partition: bool = False) -> None:
+        with self._lock:
+            if percent >= 0:
+                self.percent = percent
+            if address:
+                self.address = address
+            if message:
+                self.message = message
+            if phase:
+                self.phase = phase
+            if inc_partition:
+                self.written_partitions += 1
+
+    def finish(self, success: bool) -> None:
+        with self._lock:
+            self.active = False
+            self.phase = "done" if success else "error"
+            self.percent = 100 if success else self.percent
+            self.message = "烧录完成" if success else "烧录失败"
+
+    def to_dict(self) -> dict:
+        with self._lock:
+            import time
+            elapsed = 0
+            if self.started_at:
+                elapsed = round(time.time() - self.started_at, 1)
+            return {
+                "active": self.active,
+                "phase": self.phase,
+                "percent": self.percent,
+                "address": self.address,
+                "message": self.message,
+                "total_partitions": self.total_partitions,
+                "written_partitions": self.written_partitions,
+                "elapsed": elapsed,
+            }
+
+
+# esptool 进度行正则：Writing at 0x00008000... (12 %)
+_PROGRESS_RE = re.compile(r'Writing at 0x([0-9A-Fa-f]+)\.\.\.\s*\((\d+)\s*%\)')
+# 分区验证行：Hash of data verified.
+_VERIFY_RE = re.compile(r'Hash of data verified')
+# 连接行：Connecting.....
+_CONNECT_RE = re.compile(r'Connecting')
+# 硬复位行：Hard resetting via RTS pin...
+_RESET_RE = re.compile(r'Hard resetting')
 
 
 class IdfTool:
@@ -52,6 +128,8 @@ class IdfTool:
         self.boards_dir = boards_dir or "boards"
         self.board = board or DEFAULT_BOARD
         self._on_output = on_output
+        # 烧录进度状态（外部可读，通过 to_dict() 序列化）
+        self.flash_progress = FlashProgress()
 
     def _resolve_boards_dir(self) -> str:
         """解析 boards_dir 为绝对路径"""
@@ -175,6 +253,8 @@ class IdfTool:
             for line in iter(process.stdout.readline, ""):
                 line = line.rstrip("\n")
                 full_output.append(line)
+                # 解析烧录进度
+                self._parse_flash_progress(line)
                 if self._on_output:
                     self._on_output(line)
                 logger.debug(f"[idf.py] {line}")
@@ -264,8 +344,56 @@ class IdfTool:
             if not ok:
                 return False, f"选择板型失败: {msg}"
 
+        self.flash_progress.reset(phase="flashing")
         cmd = ["-p", port, "flash"]
-        return self._run_cmd(cmd)
+        success, output = self._run_cmd(cmd)
+        self.flash_progress.finish(success)
+        return success, output
+
+    def _parse_flash_progress(self, line: str) -> None:
+        """从 idf.py / esptool 输出行解析烧录进度。
+
+        esptool 输出格式：
+            Connecting....
+            Chip is ESP32-S3 (Firmware rev: v0.2)
+            Writing at 0x00008000... (12 %)
+            Hash of data verified.
+            Hard resetting via RTS pin...
+        """
+        # 写入进度：Writing at 0x00008000... (12 %)
+        m = _PROGRESS_RE.search(line)
+        if m:
+            addr = "0x" + m.group(1).upper()
+            pct = int(m.group(2))
+            self.flash_progress.update(
+                percent=pct, address=addr,
+                message=f"写入 {addr} ({pct}%)",
+            )
+            return
+
+        # 分区验证完成
+        if _VERIFY_RE.search(line):
+            self.flash_progress.update(
+                inc_partition=True,
+                message=f"分区校验完成 (已写 {self.flash_progress.written_partitions + 1} 个分区)",
+            )
+            return
+
+        # 连接阶段
+        if _CONNECT_RE.search(line):
+            self.flash_progress.update(
+                phase="connecting", percent=0,
+                message="连接 ESP32 芯片中...",
+            )
+            return
+
+        # 硬复位（烧录完成的标志）
+        if _RESET_RE.search(line):
+            self.flash_progress.update(
+                phase="resetting", percent=100,
+                message="烧录完成，重启设备中...",
+            )
+            return
 
     def flash_monitor(self, port: str, board: Optional[str] = None) -> Tuple[bool, str]:
         """烧录并打开监视器

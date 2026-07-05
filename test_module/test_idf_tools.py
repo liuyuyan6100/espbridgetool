@@ -8,7 +8,7 @@ def test_registers_nine_tools(fake_mcp):
     expected = {
         "get_idf_config", "set_idf_config", "list_idf_versions",
         "list_idf_projects", "list_boards", "select_board",
-        "build", "flash", "clean_build",
+        "build", "flash", "get_flash_progress", "clean_build",
     }
     assert set(fake_mcp.tools.keys()) == expected
 
@@ -82,7 +82,7 @@ def test_flash_with_port_and_board(fake_mcp, mock_call, mock_fmt):
     idf_tools.register(fake_mcp)
     fake_mcp.tools["flash"](port="COM6", board="b1")
     mock_call.assert_called_once_with(
-        "POST", "/api/flash", json={"port": "COM6", "board": "b1"}, timeout=300.0
+        "POST", "/api/flash", json={"wait": False, "port": "COM6", "board": "b1"}, timeout=30.0
     )
 
 
@@ -90,7 +90,15 @@ def test_flash_minimal(fake_mcp, mock_call, mock_fmt):
     idf_tools.register(fake_mcp)
     fake_mcp.tools["flash"]()
     mock_call.assert_called_once_with(
-        "POST", "/api/flash", json={}, timeout=300.0
+        "POST", "/api/flash", json={"wait": False}, timeout=30.0
+    )
+
+
+def test_flash_wait_true(fake_mcp, mock_call, mock_fmt):
+    idf_tools.register(fake_mcp)
+    fake_mcp.tools["flash"](wait=True)
+    mock_call.assert_called_once_with(
+        "POST", "/api/flash", json={"wait": True}, timeout=300.0
     )
 
 
@@ -98,3 +106,12 @@ def test_clean_build(fake_mcp, mock_call, mock_fmt):
     idf_tools.register(fake_mcp)
     fake_mcp.tools["clean_build"]()
     mock_call.assert_called_once_with("POST", "/api/clean", timeout=300.0)
+
+
+def test_get_flash_progress(fake_mcp, mock_call, mock_fmt):
+    mock_call.return_value = {"active": True, "percent": 45, "phase": "flashing"}
+    idf_tools.register(fake_mcp)
+    result = fake_mcp.tools["get_flash_progress"]()
+    mock_call.assert_called_once_with("GET", "/api/flash/progress")
+    assert result["active"] is True
+    assert result["percent"] == 45
