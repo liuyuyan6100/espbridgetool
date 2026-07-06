@@ -352,6 +352,8 @@ body {
 }
 .flash-progress-phase.phase-connecting { background: var(--warn); }
 .flash-progress-phase.phase-flashing { background: var(--primary); }
+.flash-progress-phase.phase-building { background: var(--info); }
+.flash-progress-phase.phase-cleaning { background: var(--warn); }
 .flash-progress-phase.phase-resetting { background: var(--info); }
 .flash-progress-phase.phase-done { background: var(--success); }
 .flash-progress-phase.phase-error { background: var(--danger); }
@@ -394,6 +396,59 @@ body {
     margin-top: 4px;
     font-size: 11px;
     color: var(--text-dim);
+}
+
+/* ===== 编译 & 烧录卡片 ===== */
+.btn-group-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.btn-group-stack .btn {
+    width: 100%;
+}
+.hint-text {
+    font-size: 13px;
+    color: var(--text-secondary);
+    font-family: 'SF Mono', Consolas, monospace;
+}
+.hint-text.no-port {
+    color: var(--danger);
+}
+.build-status {
+    margin-top: 10px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    background: var(--bg-hover);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+}
+.build-status-phase {
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 600;
+    background: var(--primary);
+    color: #fff;
+    white-space: nowrap;
+}
+.build-status-phase.done { background: var(--success); }
+.build-status-phase.error { background: var(--danger); }
+.build-status-phase.building { background: var(--info); }
+.build-status-phase.cleaning { background: var(--warn); }
+.build-status-phase.flashing { background: var(--primary); }
+.build-status-msg {
+    flex: 1;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
 }
 
 /* ===== 日志显示 ===== */

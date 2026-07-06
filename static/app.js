@@ -29,12 +29,16 @@ function connectWs() {
     ws.onopen = () => { /* 无需额外操作 */ };
 
     ws.onmessage = (evt) => {
-        // 尝试解析 JSON（烧录进度事件），失败则当作普通日志
+        // 尝试解析 JSON（烧录/编译进度事件），失败则当作普通日志
         if (evt.data.startsWith('{')) {
             try {
                 const msg = JSON.parse(evt.data);
                 if (msg.type === 'flash_progress' && msg.progress) {
                     updateFlashProgress(msg.progress);
+                    return;
+                }
+                if (msg.type === 'build_progress' && msg.progress) {
+                    updateBuildProgress(msg.progress);
                     return;
                 }
             } catch (e) { /* 非 JSON，走普通日志 */ }
@@ -235,8 +239,6 @@ $('showTs').addEventListener('change', (e) => {
     renderAll();
 });
 
-$('btnClearLog').addEventListener('click', clearLog);
-
 // ============ 日志导出/清空 ============
 $('btnExport').addEventListener('click', () => {
     if (!logLines.length) {
@@ -257,13 +259,17 @@ $('btnExport').addEventListener('click', () => {
 
 // 清空前二次确认
 $('btnClearLog').addEventListener('click', () => {
-    if (!logLines.length) {
-        toast('日志已经是空的', 'warning');
+    if (!logLines.length && (!term || term.buffer.length === 0)) {
+        toast('没有可清空的内容', 'warning');
         return;
     }
     if (confirm(`确认清空 ${logLines.length} 条日志？此操作不可撤销。`)) {
         clearLog();
-        toast('日志已清空', 'success');
+        // 同时清空 xterm 终端（终端串口 / 终端Shell）
+        if (term) {
+            term.clear();
+        }
+        toast('日志和终端已清空', 'success');
     }
 });
 
@@ -284,8 +290,30 @@ async function refreshPorts() {
             });
         }
         if (current) sel.value = current;
+        updateFlashPortHint();
     } catch (e) { /* 忽略 */ }
 }
+
+/** 获取当前选中的串口，用于烧录 */
+function getSelectedPort() {
+    return $('portSelect').value || '';
+}
+
+/** 更新烧录卡片里的端口提示 */
+function updateFlashPortHint() {
+    const port = getSelectedPort();
+    const hint = $('flashPortHint');
+    if (port) {
+        hint.textContent = port;
+        hint.classList.remove('no-port');
+    } else {
+        hint.textContent = '未选择（请在上方选择串口）';
+        hint.classList.add('no-port');
+    }
+}
+
+// 串口选择变化时更新提示
+$('portSelect').addEventListener('change', updateFlashPortHint);
 
 async function openSerial() {
     const port = $('portSelect').value;
@@ -566,6 +594,13 @@ function initTerminal() {
         }
     });
 
+    // 终端大小变化时通知后端调整 PTY 尺寸
+    term.onResize((size) => {
+        if (termWs && termWs.readyState === WebSocket.OPEN) {
+            termWs.send(JSON.stringify({ type: "resize", cols: size.cols, rows: size.rows }));
+        }
+    });
+
     window.addEventListener('resize', () => {
         if (currentMode !== 'log' && termFit) termFit.fit();
     });
@@ -587,7 +622,16 @@ function connectTerminal(mode) {
 
     termWs.onopen = () => {
         $('termStatus').textContent = mode === 'serial' ? '串口已连接' : 'Shell 已连接';
-        if (term) term.focus();
+        if (term) {
+            term.focus();
+            // 连接后立即同步 xterm 尺寸给后端 PTY，避免光标错位
+            if (termFit) termFit.fit();
+            const cols = term.cols;
+            const rows = term.rows;
+            if (cols && rows) {
+                termWs.send(JSON.stringify({ type: "resize", cols: cols, rows: rows }));
+            }
+        }
     };
 
     termWs.onmessage = (evt) => {
@@ -640,11 +684,169 @@ document.querySelectorAll('#viewModeGroup .seg-btn').forEach(btn => {
             $('termControls').style.display = 'inline-flex';
 
             initTerminal();
-            setTimeout(() => termFit.fit(), 50);
-            connectTerminal(mode);
+            // 切换模式时清空终端，避免串口/Shell 输出混杂
+            if (term) term.clear();
+            setTimeout(() => {
+                termFit.fit();
+                // fit 后再连接，确保 PTY 尺寸正确
+                connectTerminal(mode);
+            }, 50);
         }
     });
 });
+
+// ============ 编译 & 烧录 ============
+
+const buildEls = {
+    btnBuild: document.getElementById('btnBuild'),
+    btnFlash: document.getElementById('btnFlash'),
+    btnClean: document.getElementById('btnCleanBuild'),
+    status: document.getElementById('buildStatus'),
+    phase: document.getElementById('buildPhase'),
+    msg: document.getElementById('buildMsg'),
+};
+
+let buildInProgress = false;
+
+function setBuildStatus(phase, msg, show = true) {
+    // phase 可能是英文（building/cleaning/flashing/done/error），转成中文
+    const labelMap = {
+        building: '编译中', cleaning: '清理中', flashing: '烧录中',
+        done: '完成', error: '失败', connecting: '连接中', resetting: '重启中',
+    };
+    const label = labelMap[phase] || phase || '';
+    buildEls.status.style.display = show ? 'flex' : 'none';
+    buildEls.phase.textContent = label;
+    buildEls.phase.className = 'build-status-phase phase-' + (phase || '').toLowerCase();
+    buildEls.msg.textContent = msg || '';
+}
+
+/** 处理后端推送的编译/清理进度 */
+function updateBuildProgress(prog) {
+    if (!prog) return;
+    const phaseMap = {
+        building: '编译中', cleaning: '清理中', flashing: '烧录中',
+        resetting: '重启中', done: '完成', error: '失败', connecting: '连接中',
+    };
+    const phaseLabel = phaseMap[prog.phase] || prog.phase || '';
+    const show = prog.active || prog.phase === 'done' || prog.phase === 'error';
+    if (show) {
+        setBuildStatus(phaseLabel, prog.message || '', true);
+        // 同步更新主进度条（编译/清理时也显示进度条）
+        if (typeof updateFlashProgress === 'function') {
+            updateFlashProgress(prog);
+        }
+    }
+    // 完成后恢复按钮
+    if (!prog.active) {
+        setBuildButtonsDisabled(false);
+        buildInProgress = false;
+        setTimeout(() => { buildEls.status.style.display = 'none'; }, 5000);
+    }
+}
+
+function setBuildButtonsDisabled(disabled) {
+    buildEls.btnBuild.disabled = disabled;
+    buildEls.btnFlash.disabled = disabled;
+    buildEls.btnClean.disabled = disabled;
+}
+
+/** 编译 */
+async function doBuild() {
+    if (buildInProgress) return;
+    buildInProgress = true;
+    setBuildButtonsDisabled(true);
+    setBuildStatus('building', '编译中...');
+    try {
+        const res = await fetch('/api/build', { method: 'POST' });
+        const data = await res.json();
+        if (data.ok) {
+            setBuildStatus('done', '编译成功');
+            toast('编译成功', 'success');
+        } else {
+            setBuildStatus('error', '编译失败: ' + (data.error || '').slice(0, 80));
+            toast('编译失败', 'error');
+        }
+    } catch (e) {
+        setBuildStatus('error', '请求失败: ' + e.message);
+        toast('编译请求失败: ' + e.message, 'error');
+    } finally {
+        setBuildButtonsDisabled(false);
+        buildInProgress = false;
+        setTimeout(() => { buildEls.status.style.display = 'none'; }, 5000);
+    }
+}
+
+/** 烧录（使用左上角选择的串口） */
+async function doFlash() {
+    if (buildInProgress) return;
+    const port = getSelectedPort();
+    if (!port) {
+        toast('请先在左上角选择串口', 'error');
+        return;
+    }
+    buildInProgress = true;
+    setBuildButtonsDisabled(true);
+    setBuildStatus('flashing', `烧录中... 端口: ${port}`);
+    // 触发进度条轮询
+    if (typeof pollFlashProgress === 'function') {
+        flashPollTimer = setTimeout(pollFlashProgress, 500);
+    }
+    try {
+        const res = await fetch('/api/flash', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ port }),
+        });
+        const data = await res.json();
+        if (data.ok) {
+            setBuildStatus('done', '烧录成功');
+            toast('烧录成功', 'success');
+        } else {
+            setBuildStatus('error', '烧录失败: ' + (data.error || data.output || '').slice(0, 80));
+            toast('烧录失败', 'error');
+        }
+    } catch (e) {
+        setBuildStatus('error', '请求失败: ' + e.message);
+        toast('烧录请求失败: ' + e.message, 'error');
+    } finally {
+        setBuildButtonsDisabled(false);
+        buildInProgress = false;
+        setTimeout(() => { buildEls.status.style.display = 'none'; }, 8000);
+    }
+}
+
+/** 清理 */
+async function doCleanBuild() {
+    if (buildInProgress) return;
+    buildInProgress = true;
+    setBuildButtonsDisabled(true);
+    setBuildStatus('cleaning', '清理中 (fullclean)...');
+    try {
+        const res = await fetch('/api/clean', { method: 'POST' });
+        const data = await res.json();
+        if (data.ok) {
+            setBuildStatus('done', '清理完成');
+            toast('清理完成', 'success');
+        } else {
+            setBuildStatus('error', '清理失败: ' + (data.error || '').slice(0, 80));
+            toast('清理失败', 'error');
+        }
+    } catch (e) {
+        setBuildStatus('error', '请求失败: ' + e.message);
+    } finally {
+        setBuildButtonsDisabled(false);
+        buildInProgress = false;
+        setTimeout(() => { buildEls.status.style.display = 'none'; }, 5000);
+    }
+}
+
+buildEls.btnBuild.addEventListener('click', doBuild);
+buildEls.btnFlash.addEventListener('click', doFlash);
+buildEls.btnClean.addEventListener('click', doCleanBuild);
+
+// 初始化时更新端口提示
+updateFlashPortHint();
 
 // ============ 烧录进度 ============
 
@@ -666,6 +868,7 @@ const PHASE_LABELS = {
     done: '完成',
     error: '失败',
     building: '编译中',
+    cleaning: '清理中',
 };
 
 let flashPollTimer = null;
@@ -691,11 +894,34 @@ function updateFlashProgress(prog) {
         (prog.phase === 'error' ? ' error' : '') +
         (prog.phase === 'done' ? ' done' : '');
 
-    flashEls.addr.textContent = prog.address ? '地址: ' + prog.address : '';
-    flashEls.partitions.textContent = prog.written_partitions > 0
-        ? '分区: ' + prog.written_partitions : '';
-    flashEls.elapsed.textContent = prog.elapsed > 0
-        ? '耗时: ' + prog.elapsed + 's' : '';
+    // 地址（烧录阶段）或编译步骤（编译阶段）
+    if (prog.address) {
+        flashEls.addr.textContent = '地址: ' + prog.address;
+    } else if (prog.build_step) {
+        flashEls.addr.textContent = '步骤: ' + prog.build_step;
+    } else {
+        flashEls.addr.textContent = '';
+    }
+
+    // 分区数（烧录）或文件数（编译）
+    if (prog.written_partitions > 0) {
+        flashEls.partitions.textContent = '分区: ' + prog.written_partitions;
+    } else if (prog.files_built > 0) {
+        flashEls.partitions.textContent = '已编译: ' + prog.files_built + ' 个文件';
+    } else {
+        flashEls.partitions.textContent = '';
+    }
+
+    // 耗时 + 心跳检测
+    let elapsedText = prog.elapsed > 0 ? '耗时: ' + prog.elapsed + 's' : '';
+    if (prog.active && prog.idle_seconds !== undefined && prog.idle_seconds > 5) {
+        // 超过 5 秒没有新输出，显示警告
+        elapsedText += ' ⚠️ 无输出 ' + prog.idle_seconds + 's';
+        flashEls.barFill.style.opacity = '0.5';
+    } else {
+        flashEls.barFill.style.opacity = '1';
+    }
+    flashEls.elapsed.textContent = elapsedText;
 
     // 完成或失败后停止轮询
     if (!prog.active && flashPollTimer) {

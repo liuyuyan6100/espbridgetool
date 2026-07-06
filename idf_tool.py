@@ -23,7 +23,7 @@ DEFAULT_BOARD = "lckfb_szpi_esp32s3"
 
 @dataclass
 class FlashProgress:
-    """烧录进度状态（线程安全）"""
+    """烧录/编译进度状态（线程安全）"""
     active: bool = False
     phase: str = ""          # "building" / "flashing" / "done" / "error" / ""
     percent: int = 0         # 0-100
@@ -31,7 +31,10 @@ class FlashProgress:
     message: str = ""        # 人类可读状态消息
     total_partitions: int = 0  # 总分区数
     written_partitions: int = 0  # 已完成分区数
+    files_built: int = 0     # 已编译文件数（build 阶段）
+    build_step: str = ""     # 当前编译步骤（如 "Compiling" / "Linking" / "Generating"）
     started_at: Optional[float] = None  # 开始时间戳
+    last_output_at: Optional[float] = None  # 最后一次输出时间戳（心跳检测）
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def reset(self, phase: str = "flashing") -> None:
@@ -40,14 +43,19 @@ class FlashProgress:
             self.phase = phase
             self.percent = 0
             self.address = ""
-            self.message = "开始烧录"
+            self.message = "开始" + ("编译" if phase == "building" else "烧录")
             self.total_partitions = 0
             self.written_partitions = 0
+            self.files_built = 0
+            self.build_step = ""
             import time
-            self.started_at = time.time()
+            now = time.time()
+            self.started_at = now
+            self.last_output_at = now
 
     def update(self, percent: int = -1, address: str = "", message: str = "",
-               phase: str = "", inc_partition: bool = False) -> None:
+               phase: str = "", inc_partition: bool = False,
+               inc_file: bool = False, build_step: str = "") -> None:
         with self._lock:
             if percent >= 0:
                 self.percent = percent
@@ -59,20 +67,28 @@ class FlashProgress:
                 self.phase = phase
             if inc_partition:
                 self.written_partitions += 1
+            if inc_file:
+                self.files_built += 1
+            if build_step:
+                self.build_step = build_step
+            import time
+            self.last_output_at = time.time()
 
     def finish(self, success: bool) -> None:
         with self._lock:
             self.active = False
             self.phase = "done" if success else "error"
             self.percent = 100 if success else self.percent
-            self.message = "烧录完成" if success else "烧录失败"
+            self.message = "完成" if success else "失败"
+            import time
+            self.last_output_at = time.time()
 
     def to_dict(self) -> dict:
         with self._lock:
             import time
-            elapsed = 0
-            if self.started_at:
-                elapsed = round(time.time() - self.started_at, 1)
+            now = time.time()
+            elapsed = round(now - self.started_at, 1) if self.started_at else 0
+            idle_seconds = round(now - self.last_output_at, 1) if self.last_output_at else 0
             return {
                 "active": self.active,
                 "phase": self.phase,
@@ -81,7 +97,10 @@ class FlashProgress:
                 "message": self.message,
                 "total_partitions": self.total_partitions,
                 "written_partitions": self.written_partitions,
+                "files_built": self.files_built,
+                "build_step": self.build_step,
                 "elapsed": elapsed,
+                "idle_seconds": idle_seconds,
             }
 
 
@@ -93,6 +112,21 @@ _VERIFY_RE = re.compile(r'Hash of data verified')
 _CONNECT_RE = re.compile(r'Connecting')
 # 硬复位行：Hard resetting via RTS pin...
 _RESET_RE = re.compile(r'Hard resetting')
+
+# === idf.py build 输出正则 ===
+# 编译 C/C++ 文件：Building CXX file CMakeFiles/xxx.dir/xxx.c.obj
+_BUILD_CXX_RE = re.compile(r'Building CXX file')
+_BUILD_C_RE = re.compile(r'Building C object')
+# 链接：Linking CXX executable xxx.elf
+_LINK_RE = re.compile(r'Linking')
+# 生成二进制：Generating binary image from xxx
+_GEN_RE = re.compile(r'Generating')
+# 编译完成：Project build complete.
+_BUILD_DONE_RE = re.compile(r'Project build complete')
+# 执行动作：Executing action: build
+_ACTION_RE = re.compile(r'Executing action:\s*(\w+)')
+# cmake 配置阶段
+_CMAKE_RE = re.compile(r'Running CMake|Configuring done|Generating done')
 
 
 class IdfTool:
@@ -330,7 +364,11 @@ class IdfTool:
             if not ok:
                 return False, f"选择板型失败: {msg}"
 
-        return self._run_cmd(["build"])
+        self.flash_progress.reset(phase="building")
+        self.flash_progress.update(message="启动 idf.py build...")
+        success, output = self._run_cmd(["build"])
+        self.flash_progress.finish(success)
+        return success, output
 
     def flash(self, port: str, board: Optional[str] = None) -> Tuple[bool, str]:
         """烧录固件（需先释放串口）
@@ -351,7 +389,7 @@ class IdfTool:
         return success, output
 
     def _parse_flash_progress(self, line: str) -> None:
-        """从 idf.py / esptool 输出行解析烧录进度。
+        """从 idf.py / esptool 输出行解析烧录/编译进度。
 
         esptool 输出格式：
             Connecting....
@@ -359,7 +397,18 @@ class IdfTool:
             Writing at 0x00008000... (12 %)
             Hash of data verified.
             Hard resetting via RTS pin...
+
+        idf.py build 输出格式：
+            Executing action: build
+            Running CMake on /path/to/project
+            Building CXX file CMakeFiles/xxx.dir/xxx.cpp.obj
+            Building C object CMakeFiles/xxx.dir/xxx.c.obj
+            Linking CXX executable xxx.elf
+            Generating binary image from xxx
+            Project build complete. To flash, run ...
         """
+        # === 烧录阶段解析 ===
+
         # 写入进度：Writing at 0x00008000... (12 %)
         m = _PROGRESS_RE.search(line)
         if m:
@@ -395,6 +444,69 @@ class IdfTool:
             )
             return
 
+        # === 编译阶段解析 ===
+
+        # 只在 building 阶段解析以下内容
+        if self.flash_progress.phase != "building":
+            return
+
+        # 编译完成
+        if _BUILD_DONE_RE.search(line):
+            self.flash_progress.update(
+                percent=100, build_step="Done",
+                message="编译完成",
+            )
+            return
+
+        # 执行动作
+        m = _ACTION_RE.search(line)
+        if m:
+            action = m.group(1)
+            self.flash_progress.update(
+                message=f"执行 {action}...",
+            )
+            return
+
+        # CMake 配置阶段
+        if _CMAKE_RE.search(line):
+            self.flash_progress.update(
+                build_step="CMake",
+                message="CMake 配置中...",
+            )
+            return
+
+        # 编译 C++ 文件
+        if _BUILD_CXX_RE.search(line):
+            self.flash_progress.update(
+                inc_file=True, build_step="Compiling C++",
+                message=f"编译 C++ 文件 (已编译 {self.flash_progress.files_built + 1} 个)",
+            )
+            return
+
+        # 编译 C 文件
+        if _BUILD_C_RE.search(line):
+            self.flash_progress.update(
+                inc_file=True, build_step="Compiling C",
+                message=f"编译 C 文件 (已编译 {self.flash_progress.files_built + 1} 个)",
+            )
+            return
+
+        # 链接
+        if _LINK_RE.search(line):
+            self.flash_progress.update(
+                percent=90, build_step="Linking",
+                message="链接中...",
+            )
+            return
+
+        # 生成二进制
+        if _GEN_RE.search(line):
+            self.flash_progress.update(
+                percent=95, build_step="Generating",
+                message="生成二进制...",
+            )
+            return
+
     def flash_monitor(self, port: str, board: Optional[str] = None) -> Tuple[bool, str]:
         """烧录并打开监视器
 
@@ -423,7 +535,11 @@ class IdfTool:
 
     def fullclean(self) -> Tuple[bool, str]:
         """清理编译产物"""
-        return self._run_cmd(["fullclean"])
+        self.flash_progress.reset(phase="cleaning")
+        self.flash_progress.update(message="清理中 (fullclean)...")
+        success, output = self._run_cmd(["fullclean"])
+        self.flash_progress.finish(success)
+        return success, output
 
     def bmgr(self, board: Optional[str] = None) -> Tuple[bool, str]:
         """运行 bmgr 选择板型（兼容旧接口）

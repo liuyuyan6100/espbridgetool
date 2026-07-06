@@ -77,6 +77,7 @@ MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
 FLASH_JOB_LOCK = threading.RLock()
 FLASH_JOB: Optional[Dict[str, Any]] = None
 FLASH_JOB_SEQ = 0
+BUILD_JOB: Optional[Dict[str, Any]] = None  # 编译/清理任务状态
 
 
 def _on_serial_data(data: bytes):
@@ -206,27 +207,38 @@ _FLASH_LOG_STATE = {"percent": -1, "ts": 0.0}
 def _idf_output_callback(line: str):
     """idf.py 输出回调：推送到日志缓冲 + WebSocket + 落盘
 
-    如果当前正在烧录，解析出的进度变化也会通过 WebSocket 推送。
+    如果当前正在烧录或编译，解析出的进度变化也会通过 WebSocket 推送。
     """
     BUFFER.append(line)
     SINK.write(f"[idf.py] {line}")
     _broadcast_task(f"[idf.py] {line}")
-    # 烧录进度变化时额外推送进度事件
+    # 烧录/编译/清理进度变化时额外推送进度事件
     if IDF is not None and IDF.flash_progress.active:
         prog = IDF.flash_progress.to_dict()
+        phase = prog.get("phase", "")
+        if phase in ("building", "cleaning"):
+            evt_type = "build_progress"
+        else:
+            evt_type = "flash_progress"
         _broadcast_task(json.dumps(
-            {"type": "flash_progress", "progress": prog},
+            {"type": evt_type, "progress": prog},
             ensure_ascii=False
         ))
-        # 节流打到控制台，让 bat 终端能看到烧录仍在推进
+        # 节流打到控制台，让 bat 终端能看到进度仍在推进
         now = time.time()
         percent = prog.get("percent", 0)
         if (percent - _FLASH_LOG_STATE["percent"] >= 5
                 or now - _FLASH_LOG_STATE["ts"] >= 5):
             _FLASH_LOG_STATE["percent"] = percent
             _FLASH_LOG_STATE["ts"] = now
+            phase = prog.get("phase", "")
+            phase_label = {
+                "building": "编译进度", "cleaning": "清理进度",
+                "flashing": "烧录进度", "connecting": "连接进度",
+                "resetting": "重启进度", "done": "完成", "error": "失败",
+            }.get(phase, "进度")
             logger.info(
-                f"烧录进度: {percent}% "
+                f"{phase_label}: {percent}% "
                 f"{prog.get('address', '')} {prog.get('message', '')}"
             )
 
@@ -750,15 +762,40 @@ async def api_idf_projects():
 
 @app.post("/api/build")
 async def api_build(data: dict = {}):
-    """触发编译"""
-    global IDF
+    """触发编译（后台线程执行，不阻塞事件循环）"""
+    global IDF, BUILD_JOB
     if IDF is None:
         return JSONResponse(
             {"ok": False, "error": "IDF 工具未初始化，请在配置中设置项目目录"},
             status_code=400,
         )
+    if BUILD_JOB and BUILD_JOB.get("active"):
+        return JSONResponse(
+            {"ok": False, "error": "已有编译/清理任务在执行中"}, status_code=409
+        )
+
     board = data.get("board")
-    ok, output = IDF.build(board=board)
+    loop = asyncio.get_event_loop()
+
+    # 重置进度状态
+    IDF.flash_progress.reset(phase="building")
+    _broadcast_task(json.dumps(
+        {"type": "build_progress", "progress": IDF.flash_progress.to_dict()},
+        ensure_ascii=False
+    ))
+
+    # 在线程池中执行（不阻塞事件循环）
+    ok, output = await loop.run_in_executor(None, lambda: IDF.build(board=board))
+
+    IDF.flash_progress.finish(ok)
+    _broadcast_task(json.dumps(
+        {"type": "build_progress", "progress": IDF.flash_progress.to_dict()},
+        ensure_ascii=False
+    ))
+
+    result_msg = f"[bridge] 编译{'成功' if ok else '失败'}"
+    BUFFER.append(result_msg)
+    await _broadcast(result_msg)
     return {"ok": ok, "output": output[:500] if not ok else "编译完成"}
 
 
@@ -861,13 +898,39 @@ async def api_flash_progress():
 
 @app.post("/api/clean")
 async def api_clean():
-    """触发 fullclean"""
-    global IDF
+    """触发 fullclean（后台线程执行，不阻塞事件循环）"""
+    global IDF, BUILD_JOB
     if IDF is None:
         return JSONResponse(
             {"ok": False, "error": "IDF 工具未初始化"}, status_code=400
         )
-    ok, output = IDF.fullclean()
+    if BUILD_JOB and BUILD_JOB.get("active"):
+        return JSONResponse(
+            {"ok": False, "error": "已有编译/清理任务在执行中"}, status_code=409
+        )
+
+    loop = asyncio.get_event_loop()
+
+    # 重置进度状态
+    IDF.flash_progress.reset(phase="cleaning")
+    IDF.flash_progress.update(message="清理中 (fullclean)...")
+    _broadcast_task(json.dumps(
+        {"type": "build_progress", "progress": IDF.flash_progress.to_dict()},
+        ensure_ascii=False
+    ))
+
+    # 在线程池中执行
+    ok, output = await loop.run_in_executor(None, lambda: IDF.fullclean())
+
+    IDF.flash_progress.finish(ok)
+    _broadcast_task(json.dumps(
+        {"type": "build_progress", "progress": IDF.flash_progress.to_dict()},
+        ensure_ascii=False
+    ))
+
+    result_msg = f"[bridge] 清理{'成功' if ok else '失败'}"
+    BUFFER.append(result_msg)
+    await _broadcast(result_msg)
     return {"ok": ok, "output": output[:300]}
 
 
@@ -1044,10 +1107,25 @@ async def ws_terminal(websocket: WebSocket, mode: str = "serial"):
             spawn_env.pop(k, None)
 
         # 用 PowerShell 直接启动（不经过 cmd.exe 嵌套，避免输出交错）
+        # 初始尺寸用合理默认值，后续通过 resize 消息调整
         pty = PTY(120, 30)
         powershell_path = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
         project_dir = os.getenv("IDF_PROJECT_DIR", "")
         export_script = os.getenv("IDF_EXPORT_SCRIPT", "")
+
+        # 缓存前端发来的 resize 请求，在初始化命令执行完后应用
+        # （初始化期间 PTY 可能还没就绪，resize 会丢失）
+        pending_resize = {"cols": 120, "rows": 30}
+
+        # 自动检测 IDF Python 环境路径（和 idf_tool.py 同逻辑）
+        # export.ps1 会按系统 Python 版本找 idf5.5_py3.X_env，
+        # 但系统 Python 版本可能和 IDF 安装时不一致（如装时 3.13，系统有 3.12）
+        py_env_clause = ""
+        if IDF is not None:
+            py_env = IDF._detect_python_env()
+            if py_env:
+                py_env_escaped = py_env.replace("'", "''")
+                py_env_clause = f"$env:IDF_PYTHON_ENV_PATH='{py_env_escaped}'; "
 
         try:
             pty.spawn(
@@ -1059,35 +1137,50 @@ async def ws_terminal(websocket: WebSocket, mode: str = "serial"):
             await websocket.send_text(f"[bridge] PTY 启动失败: {e}\r\n")
             return
 
-        # 等待 PowerShell 完成启动
+        # 等待 PowerShell 完成启动（缩短到 0.8s）
         import time
-        time.sleep(1.5)
+        time.sleep(0.8)
 
-        # 初始化命令（PowerShell 语法），每条之间留间隔确保执行
+        # 初始化命令（精简版，合并为一条减少等待）
         init_cmds = [
-            # 设置 UTF-8 编码，解决中文乱码
-            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8",
-            "$OutputEncoding = [System.Text.Encoding]::UTF8",
-            # 清除 MSYS/Mingw 环境变量（ESP-IDF export.ps1 会检测）
-            "Remove-Item Env:MSYSTEM -ErrorAction SilentlyContinue",
-            "Remove-Item Env:MSYSTEM_CHOST -ErrorAction SilentlyContinue",
+            # 一条命令搞定：UTF-8 编码 + 清除 MSYS 变量
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+            "$OutputEncoding = [System.Text.Encoding]::UTF8; "
+            "Remove-Item Env:MSYSTEM -ErrorAction SilentlyContinue; "
+            "Remove-Item Env:MSYSTEM_CHOST -ErrorAction SilentlyContinue; "
             "Remove-Item Env:MSYSTEM_PREFIX -ErrorAction SilentlyContinue",
         ]
 
         if export_script and os.path.isfile(export_script):
-            init_cmds.append(f". '{export_script}'")
+            # 在 export.ps1 之前设 IDF_PYTHON_ENV_PATH，绕过版本检测
+            export_escaped = export_script.replace("'", "''")
+            init_cmds.append(
+                f"{py_env_clause}. '{export_escaped}'; "
+                f"if ($LASTEXITCODE -eq 0 -or $?) {{ "
+                f"Write-Host '[bridge] IDF 环境加载成功' -ForegroundColor Green "
+                f"}} else {{ "
+                f"Write-Host '[bridge] IDF 环境加载失败，请检查路径' -ForegroundColor Red "
+                f"}}"
+            )
+        else:
+            init_cmds.append(
+                "Write-Host '[bridge] 警告: 未配置 export.ps1，idf.py 不可用' -ForegroundColor Yellow"
+            )
 
-        init_cmds.append(
-            "Write-Host '[bridge] Shell 终端就绪，IDF 环境已加载' -ForegroundColor Green"
-        )
-
-        for i, cmd in enumerate(init_cmds):
+        for cmd in init_cmds:
             pty.write(cmd + "\r\n")
-            # 每条命令之间间隔 0.5s，确保 PowerShell 有时间执行
-            time.sleep(0.5)
+            time.sleep(0.3)
+
+        # 初始化完成后，应用缓存的 resize 请求
+        try:
+            pty.set_size(pending_resize["cols"], pending_resize["rows"])
+            logger.debug(f"PTY 初始 resize: {pending_resize['cols']}x{pending_resize['rows']}")
+        except Exception as e:
+            logger.warning(f"PTY 初始 resize 失败: {e}")
 
         # 后台线程：持续读取 PTY 输出 → 推到 WS
         pty_running = True
+        pty_ready = True  # 初始化已完成，resize 可直接应用
 
         def _pty_reader():
             while pty_running:
@@ -1127,7 +1220,25 @@ async def ws_terminal(websocket: WebSocket, mode: str = "serial"):
                 if "bytes" in msg and msg["bytes"] is not None:
                     pty.write(msg["bytes"].decode("utf-8", errors="replace"))
                 elif "text" in msg and msg["text"] is not None:
-                    pty.write(msg["text"])
+                    text = msg["text"]
+                    # 检查是否是 resize 消息
+                    if text.startswith('{') and '"type":"resize"' in text:
+                        try:
+                            resize_msg = json.loads(text)
+                            if resize_msg.get("type") == "resize":
+                                cols = resize_msg.get("cols", 120)
+                                rows = resize_msg.get("rows", 30)
+                                if pty_ready:
+                                    pty.set_size(cols, rows)
+                                    logger.debug(f"PTY resize: {cols}x{rows}")
+                                else:
+                                    # 初始化期间缓存，稍后应用
+                                    pending_resize["cols"] = cols
+                                    pending_resize["rows"] = rows
+                                continue
+                        except (json.JSONDecodeError, KeyError, Exception):
+                            pass
+                    pty.write(text)
         except WebSocketDisconnect:
             pass
         except Exception as e:

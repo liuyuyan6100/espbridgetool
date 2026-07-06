@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Serial Bridge — ESP32 串口调试</title>
-    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="/static/style.css?v=1.7">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
 </head>
 <body>
@@ -102,6 +102,29 @@
                     <span class="stat-value" id="statLogs">0</span>
                 </div>
                 <button id="btnResetStats" class="btn btn-ghost btn-sm">重置统计</button>
+            </div>
+        </div>
+
+        <!-- 编译 & 烧录 -->
+        <div class="card">
+            <div class="card-header">
+                <span>编译 &amp; 烧录</span>
+                <button class="btn-toggle" id="toggleBuild">▾</button>
+            </div>
+            <div class="card-body" id="buildPanel">
+                <div class="form-row">
+                    <label>目标端口</label>
+                    <span class="hint-text" id="flashPortHint">未选择</span>
+                </div>
+                <div class="btn-group btn-group-stack">
+                    <button id="btnBuild" class="btn btn-primary">编译 (build)</button>
+                    <button id="btnFlash" class="btn btn-primary">烧录 (flash)</button>
+                    <button id="btnCleanBuild" class="btn btn-ghost btn-sm">清理 (fullclean)</button>
+                </div>
+                <div class="build-status" id="buildStatus" style="display:none;">
+                    <span class="build-status-phase" id="buildPhase">编译中</span>
+                    <span class="build-status-msg" id="buildMsg"></span>
+                </div>
             </div>
         </div>
 
@@ -230,6 +253,6 @@
 
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=2.1"></script>
 </body>
 </html>
