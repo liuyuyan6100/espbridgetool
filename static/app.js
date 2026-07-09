@@ -701,6 +701,7 @@ const buildEls = {
     btnBuild: document.getElementById('btnBuild'),
     btnFlash: document.getElementById('btnFlash'),
     btnClean: document.getElementById('btnCleanBuild'),
+    btnErase: document.getElementById('btnEraseFlash'),
     status: document.getElementById('buildStatus'),
     phase: document.getElementById('buildPhase'),
     msg: document.getElementById('buildMsg'),
@@ -712,6 +713,7 @@ function setBuildStatus(phase, msg, show = true) {
     // phase 可能是英文（building/cleaning/flashing/done/error），转成中文
     const labelMap = {
         building: '编译中', cleaning: '清理中', flashing: '烧录中',
+        erasing: '擦除中',
         done: '完成', error: '失败', connecting: '连接中', resetting: '重启中',
     };
     const label = labelMap[phase] || phase || '';
@@ -841,9 +843,43 @@ async function doCleanBuild() {
     }
 }
 
+/** 擦除 flash */
+async function doEraseFlash() {
+    if (buildInProgress) return;
+    if (!confirm('确认擦除整个 flash？\n\n这会清除所有分区数据（bootloader、分区表、otadata、应用固件）。\n擦除后必须重新编译烧录才能启动。')) {
+        return;
+    }
+    buildInProgress = true;
+    setBuildButtonsDisabled(true);
+    setBuildStatus('erasing', '擦除 flash 中 (erase-flash)...');
+    try {
+        const port = currentPort || 'COM6';
+        const res = await fetch('/api/erase-flash', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ port }),
+        });
+        const data = await res.json();
+        if (data.ok) {
+            setBuildStatus('done', '擦除完成，请重新编译烧录');
+            toast('Flash 擦除完成，请重新 build + flash', 'success');
+        } else {
+            setBuildStatus('error', '擦除失败: ' + (data.error || '').slice(0, 80));
+            toast('擦除失败', 'error');
+        }
+    } catch (e) {
+        setBuildStatus('error', '请求失败: ' + e.message);
+    } finally {
+        setBuildButtonsDisabled(false);
+        buildInProgress = false;
+        setTimeout(() => { buildEls.status.style.display = 'none'; }, 8000);
+    }
+}
+
 buildEls.btnBuild.addEventListener('click', doBuild);
 buildEls.btnFlash.addEventListener('click', doFlash);
 buildEls.btnClean.addEventListener('click', doCleanBuild);
+buildEls.btnErase.addEventListener('click', doEraseFlash);
 
 // 初始化时更新端口提示
 updateFlashPortHint();

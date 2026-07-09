@@ -75,12 +75,17 @@ class SerialManager:
     # ---- 打开 / 关闭 ----
 
     def open(self, port: str, baud: int = 115200) -> bool:
-        """打开串口，启动后台读取线程"""
+        """打开串口，启动后台读取线程
+
+        即使打开失败也会启动后台读取线程，进入自动重连模式。
+        这样启动时设备未插入，后续插入后能自动恢复连接。
+        """
         with self._lock:
             if self.is_open:
                 logger.warning("串口已打开，先关闭再重新打开")
                 self._close_unlocked()
 
+            success = False
             try:
                 self._ser = serial.Serial(
                     port=port,
@@ -96,13 +101,20 @@ class SerialManager:
                 # 记录设备指纹，用于插拔后动态追踪
                 self._record_device_fingerprint(port)
                 logger.info(f"串口已打开: {port} @ {baud}")
-            except serial.SerialException as e:
+                success = True
+            except (serial.SerialException, OSError) as e:
                 logger.error(f"打开串口失败 {port}: {e}")
                 self._ser = None
-                return False
+                # 即使打开失败也记录目标端口和波特率，用于后台自动重连
+                self._port = port
+                self._baud = baud
+                self._closed_manually = False  # 允许自动重连
 
+        # 无论成功还是失败都启动读取线程：
+        # 成功 → 正常读取数据
+        # 失败 → 进入自动重连流程，等待设备插入
         self._start_reader()
-        return True
+        return success
 
     def _record_device_fingerprint(self, port: str) -> None:
         """记录设备的 USB 硬件指纹（VID/PID/hwid），用于插拔后追踪。
@@ -141,33 +153,76 @@ class SerialManager:
         """通过设备指纹查找当前端口。
 
         USB 重新枚举后端口可能变化，凭 VID/PID 或 hwid 找到新端口。
+        如果没有指纹信息（启动时设备未插入），尝试找任何 USB 串口设备。
         找不到返回 None。
         """
-        if not self._device_hwid and self._device_vid is None:
-            return self._port  # 没有指纹信息，用原端口
-
         try:
             ports = serial.tools.list_ports.comports()
-            for p in ports:
-                # 优先 VID/PID 匹配
-                if self._device_vid is not None and hasattr(p, 'vid') and p.vid is not None:
-                    if p.vid == self._device_vid and p.pid == self._device_pid:
+            # 有指纹：优先按 VID/PID 或 hwid 匹配
+            if self._device_hwid or self._device_vid is not None:
+                for p in ports:
+                    # 优先 VID/PID 匹配
+                    if self._device_vid is not None and hasattr(p, 'vid') and p.vid is not None:
+                        if p.vid == self._device_vid and p.pid == self._device_pid:
+                            if p.device != self._port:
+                                logger.info(
+                                    f"设备端口变化: {self._port} → {p.device} "
+                                    f"(VID/PID 匹配)"
+                                )
+                            return p.device
+                    # 退回 hwid 匹配
+                    if self._device_hwid and p.hwid == self._device_hwid:
                         if p.device != self._port:
                             logger.info(
                                 f"设备端口变化: {self._port} → {p.device} "
-                                f"(VID/PID 匹配)"
+                                f"(hwid 匹配)"
                             )
                         return p.device
-                # 退回 hwid 匹配
-                if self._device_hwid and p.hwid == self._device_hwid:
-                    if p.device != self._port:
-                        logger.info(
-                            f"设备端口变化: {self._port} → {p.device} "
-                            f"(hwid 匹配)"
-                        )
+                # 有指纹但没匹配到，设备可能还没插入
+                return None
+
+            # 无指纹（启动时设备未插入）：先看原端口是否存在
+            for p in ports:
+                if p.device == self._port:
+                    return p.device
+
+            # 原端口不存在，找任何 USB 串口设备（排除蓝牙等非 USB 设备）
+            for p in ports:
+                hwid = p.hwid or ""
+                desc = p.description or ""
+                if 'USB' in hwid or 'JTAG' in desc or 'CH340' in desc \
+                        or 'CP210' in desc or 'CH343' in desc \
+                        or 'USB' in desc:
+                    logger.info(
+                        f"无指纹模式：发现 USB 串口设备 {p.device} "
+                        f"({desc})"
+                    )
                     return p.device
         except Exception as e:
             logger.warning(f"查找设备端口失败: {e}")
+        return None
+
+    def _find_alternate_port(self, exclude_port: str) -> Optional[str]:
+        """找一个备用的 USB 串口端口（排除指定端口和蓝牙端口）。
+
+        用于 CH340 端口打不开时尝试 ESP32-S3 原生 USB 口等其他端口。
+        """
+        try:
+            ports = serial.tools.list_ports.comports()
+            for p in ports:
+                if p.device == exclude_port:
+                    continue
+                hwid = p.hwid or ""
+                desc = p.description or ""
+                # 排除蓝牙虚拟串口
+                if 'BTHENUM' in hwid or '蓝牙' in desc:
+                    continue
+                # 只考虑 USB 串口设备
+                if 'USB' in hwid or 'CH340' in desc or 'CP210' in desc \
+                        or 'JTAG' in desc or 'USB' in desc:
+                    return p.device
+        except Exception as e:
+            logger.warning(f"查找备用端口失败: {e}")
         return None
 
     def close(self) -> None:
@@ -246,6 +301,17 @@ class SerialManager:
                             logger.info("等待 USB 设备插入...")
                             time.sleep(2)
                             continue
+                        # 连续失败超过 5 次，尝试其他可用 USB 串口
+                        # （CH340 可能在 boot loop 时一直 OSError 22，
+                        #  但 ESP32-S3 原生 USB 口可能可用）
+                        if retry_count >= 5 and new_port == self._port:
+                            alt_port = self._find_alternate_port(self._port)
+                            if alt_port:
+                                logger.info(
+                                    f"连续失败 {retry_count} 次，"
+                                    f"尝试备用端口: {alt_port}"
+                                )
+                                new_port = alt_port
                         self.open(new_port, self._baud)
                     else:
                         time.sleep(0.5)

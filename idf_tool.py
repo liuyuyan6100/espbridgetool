@@ -174,19 +174,64 @@ class IdfTool:
     def _detect_python_env(self) -> Optional[str]:
         """自动检测 ESP-IDF 的 Python 虚拟环境路径。
 
-        export.ps1 会按系统 Python 版本去找 C:\\Espressif\\python_env\\idf5.5_py3.X_env，
-        但系统 Python 版本可能和 IDF 安装时的版本不一致（比如 IDF 装时是 3.13，
-        后来系统降级或装了多个 Python）。这里直接扫目录，按 export_script 路径里
-        的 IDF 版本号匹配对应环境，绕过 export.ps1 的版本检测。
+        检测优先级：
+        1. CMakeCache.txt 中已记录的 Python 路径（保证和项目配置时一致）
+        2. tools\\python\\vX.X.X\\venv（和官方 IDF 终端一致，避免环境冲突）
+        3. 扫描 python_env 目录（最后手段）
+
+        背景：系统上可能存在多个 Python 虚拟环境，路径不同但版本相同：
+        - C:\\Espressif\\tools\\python\\v5.5.4\\venv     ← 官方终端用这个
+        - C:\\Espressif\\python_env\\idf5.5_py3.13_env   ← idf.py 自己创建的
+        如果 espbridgetool 和官方终端选了不同的环境，交叉使用就会报冲突。
+        所以回退时优先用官方终端的环境（tools\\python\\vX.X.X\\venv）。
 
         Returns:
             Python 环境目录绝对路径，找不到返回 None。
         """
-        # 从 export_script 路径提取 IDF 版本号（如 v5.5.4 → 5.5）
+        # 1. 优先读 CMakeCache.txt 中已记录的 Python 路径
+        cache_path = os.path.join(self.project_dir, "build", "CMakeCache.txt")
+        if os.path.isfile(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        m = re.search(
+                            r'_Python3_EXECUTABLE:INTERNAL=(.+python\.exe)',
+                            line
+                        )
+                        if m:
+                            py_exe = m.group(1).strip().replace("/", "\\")
+                            parts = py_exe.split("\\")
+                            if len(parts) >= 3 and parts[-1].lower() == "python.exe" \
+                                    and parts[-2] == "Scripts":
+                                env_dir = "\\".join(parts[:-2])
+                                if os.path.isdir(env_dir):
+                                    logger.info(
+                                        f"从 CMakeCache 检测到 Python 环境: {env_dir}"
+                                    )
+                                    return env_dir
+            except Exception as e:
+                logger.debug(f"读 CMakeCache 失败，回退到扫描: {e}")
+
+        # 2. 优先用 tools\python\vX.X.X\venv（和官方 IDF 终端一致）
         idf_ver = None
+        m = re.search(r'[v/](\d+\.\d+\.\d+)', self.export_script)
+        if m:
+            idf_ver = m.group(1)  # "5.5.4"
+        if idf_ver:
+            tools_venv = os.path.join(
+                os.environ.get("IDF_TOOLS_PATH", r"C:\Espressif"),
+                "tools", "python", f"v{idf_ver}", "venv"
+            )
+            if os.path.exists(os.path.join(tools_venv, "Scripts", "python.exe")):
+                logger.info(f"使用官方终端 Python 环境: {tools_venv}")
+                return tools_venv
+
+        # 3. 最后手段：扫描 python_env 目录
         m = re.search(r'[v/](\d+\.\d+)', self.export_script)
         if m:
-            idf_ver = m.group(1)  # "5.5"
+            idf_ver_short = m.group(1)  # "5.5"
+        else:
+            idf_ver_short = None
 
         candidates = [
             r"C:\Espressif\python_env",
@@ -195,19 +240,16 @@ class IdfTool:
         for base in candidates:
             if not os.path.isdir(base):
                 continue
-            # 找 idf*_py*_env 目录
             dirs = [d for d in os.listdir(base)
                     if d.startswith("idf") and d.endswith("_env") and "_py" in d]
-            # 优先匹配 IDF 版本号（如 idf5.5_py3.13_env）
-            if idf_ver:
-                prefix = f"idf{idf_ver}_"
+            if idf_ver_short:
+                prefix = f"idf{idf_ver_short}_"
                 matched = [d for d in dirs if d.startswith(prefix)]
                 if matched:
                     for name in matched:
                         path = os.path.join(base, name)
                         if os.path.exists(os.path.join(path, "Scripts", "python.exe")):
                             return path
-            # 版本号没匹配上，取最后一个（版本号最大的，sorted 后最后一个）
             for name in sorted(dirs, reverse=True):
                 path = os.path.join(base, name)
                 if os.path.exists(os.path.join(path, "Scripts", "python.exe")):
@@ -297,6 +339,22 @@ class IdfTool:
             retcode = process.wait(timeout=timeout)
             output = "\n".join(full_output)
             success = retcode == 0
+            # idf.py 有时即使 CMake 失败也返回 retcode=0，
+            # 需要检查输出中是否有明确的失败标志
+            if success and output:
+                for err_marker in (
+                    "CMake Error",
+                    "cmake failed with exit code",
+                    "ninja: build stopped",
+                    "FAILED:",
+                    "Configuring incomplete, errors occurred",
+                ):
+                    if err_marker in output:
+                        success = False
+                        logger.warning(
+                            f"idf.py 返回码为 0 但输出包含错误标志: {err_marker}"
+                        )
+                        break
             logger.info(f"idf.py 命令完成: success={success}, retcode={retcode}")
             return success, output
 
@@ -538,6 +596,21 @@ class IdfTool:
         self.flash_progress.reset(phase="cleaning")
         self.flash_progress.update(message="清理中 (fullclean)...")
         success, output = self._run_cmd(["fullclean"])
+        self.flash_progress.finish(success)
+        return success, output
+
+    def erase_flash(self, port: str) -> Tuple[bool, str]:
+        """擦除整个 flash 芯片（idf.py -p <port> erase-flash）
+
+        会清除所有分区数据，包括 bootloader、分区表、otadata、ota_0/ota_1。
+        擦除后必须重新 flash 才能启动。
+
+        用于修复 flash 数据损坏（如 otadata 指向空分区、image header 损坏等）。
+        """
+        self.flash_progress.reset(phase="erasing")
+        self.flash_progress.update(message=f"擦除 flash ({port})...")
+        cmd = ["-p", port, "erase-flash"]
+        success, output = self._run_cmd(cmd)
         self.flash_progress.finish(success)
         return success, output
 

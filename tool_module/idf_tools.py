@@ -146,3 +146,27 @@ def register(mcp: FastMCP) -> None:
         或编译状态异常时。耗时几十秒。
         """
         return bridge_client.fmt(bridge_client.call("POST", "/api/clean", timeout=300.0))
+
+    @mcp.tool()
+    def erase_flash(port: Optional[str] = None) -> str:
+        """擦除整个 flash 芯片（`idf.py -p <port> erase-flash`）。
+
+        会清除 ESP32 flash 上的所有数据（bootloader、分区表、otadata、应用固件等）。
+        擦除后必须重新 flash 才能启动设备。
+
+        用于修复 flash 数据损坏的场景：
+        - otadata 分区指向空分区导致无法启动
+        - app partition 的 image header 损坏（invalid segment length 0xffffffff）
+        - 多次烧录失败后 flash 状态混乱
+
+        参数:
+            port: 串口号，如 "COM6"。不传则用当前已打开的串口或默认 COM6。
+
+        擦除前会自动释放串口，擦除后自动重连。耗时约 10-30 秒。
+        """
+        payload = {}
+        if port:
+            payload["port"] = port
+        return bridge_client.fmt(
+            bridge_client.call("POST", "/api/erase-flash", json=payload, timeout=120.0)
+        )

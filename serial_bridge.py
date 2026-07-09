@@ -196,12 +196,46 @@ def _run_flash_job(job_id: str, port: str, board: Optional[str]) -> Tuple[bool, 
                     result=result,
                 )
         result_msg = f"[bridge] 烧录{'成功' if ok else '失败'} job={job_id}"
+        _clear_spin_line()
+        logger.info(result_msg)
         _bridge_log(result_msg)
         _broadcast_flash_progress()
     return ok, output
 
 
-_FLASH_LOG_STATE = {"percent": -1, "ts": 0.0}
+_FLASH_LOG_STATE = {"ts": 0.0, "phase": "", "start_ts": 0.0, "frame": 0}
+
+_SPIN_CHARS = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+
+# 终端是否支持 ANSI 转义（Windows Terminal / 新版 cmd 支持）
+import ctypes
+_kernel32 = ctypes.windll.kernel32
+_STD_OUTPUT_HANDLE = -11
+_h = _kernel32.GetStdHandle(_STD_OUTPUT_HANDLE)
+_mode = ctypes.c_uint32()
+_kernel32.GetConsoleMode(_h, ctypes.byref(_mode))
+_ANSI_OK = bool(_mode.value & 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+if _ANSI_OK:
+    _kernel32.SetConsoleMode(_h, _mode.value | 0x0004)
+
+
+def _clear_spin_line():
+    """清除终端上的旋转动画行"""
+    sys.stdout.write('\r' + ' ' * 70 + '\r')
+    sys.stdout.flush()
+
+
+def _print_spin(phase_label: str, elapsed: float, frame: int, extra: str = ""):
+    """在终端原地刷新旋转动画行"""
+    spinner = _SPIN_CHARS[frame % len(_SPIN_CHARS)]
+    line = f'\r  {spinner} {phase_label} {elapsed:.0f}s'
+    if extra:
+        line += f'  {extra}'
+    # 填充剩余空间避免残留字符
+    pad = max(0, 70 - len(line))
+    line += ' ' * pad
+    sys.stdout.write(line)
+    sys.stdout.flush()
 
 
 def _idf_output_callback(line: str):
@@ -224,23 +258,32 @@ def _idf_output_callback(line: str):
             {"type": evt_type, "progress": prog},
             ensure_ascii=False
         ))
-        # 节流打到控制台，让 bat 终端能看到进度仍在推进
+        # 终端旋转动画：原地刷新，不刷屏
+        # 烧录阶段（flashing）保留百分比，因为 esptool 的百分比是真实进度
         now = time.time()
-        percent = prog.get("percent", 0)
-        if (percent - _FLASH_LOG_STATE["percent"] >= 5
-                or now - _FLASH_LOG_STATE["ts"] >= 5):
-            _FLASH_LOG_STATE["percent"] = percent
+        phase_label = {
+            "building": "编译中", "cleaning": "清理中",
+            "flashing": "烧录中", "connecting": "连接中",
+            "resetting": "重启中", "erasing": "擦除中",
+        }.get(phase, phase or "进行中")
+
+        # 阶段切换时重置计时
+        if _FLASH_LOG_STATE["phase"] != phase:
+            _FLASH_LOG_STATE["phase"] = phase
+            _FLASH_LOG_STATE["start_ts"] = now
+            _FLASH_LOG_STATE["frame"] = 0
             _FLASH_LOG_STATE["ts"] = now
-            phase = prog.get("phase", "")
-            phase_label = {
-                "building": "编译进度", "cleaning": "清理进度",
-                "flashing": "烧录进度", "connecting": "连接进度",
-                "resetting": "重启进度", "done": "完成", "error": "失败",
-            }.get(phase, "进度")
-            logger.info(
-                f"{phase_label}: {percent}% "
-                f"{prog.get('address', '')} {prog.get('message', '')}"
-            )
+
+        # 每 0.3s 刷新一帧动画
+        if now - _FLASH_LOG_STATE["ts"] >= 0.3:
+            _FLASH_LOG_STATE["ts"] = now
+            _FLASH_LOG_STATE["frame"] += 1
+            elapsed = now - _FLASH_LOG_STATE["start_ts"]
+            extra = ""
+            if phase == "flashing":
+                percent = prog.get("percent", 0)
+                extra = f"{percent}%"
+            _print_spin(phase_label, elapsed, _FLASH_LOG_STATE["frame"], extra)
 
 
 # 注册串口数据回调（在 SERIAL 创建后立即注册）
@@ -278,7 +321,10 @@ async def lifespan(app: FastAPI):
         if ok:
             logger.info(f"串口已自动打开: {auto_port} @ {auto_baud}")
         else:
-            logger.warning(f"串口 {auto_port} 打开失败，仅启动 Web 服务")
+            logger.warning(
+                f"串口 {auto_port} 打开失败，Web 服务正常启动，"
+                f"后台自动重连已启用（插入设备后会自动连接）"
+            )
     yield
     if SERIAL.is_open:
         SERIAL.close()
@@ -794,6 +840,8 @@ async def api_build(data: dict = {}):
     ))
 
     result_msg = f"[bridge] 编译{'成功' if ok else '失败'}"
+    _clear_spin_line()
+    logger.info(result_msg)
     BUFFER.append(result_msg)
     await _broadcast(result_msg)
     return {"ok": ok, "output": output[:500] if not ok else "编译完成"}
@@ -929,9 +977,67 @@ async def api_clean():
     ))
 
     result_msg = f"[bridge] 清理{'成功' if ok else '失败'}"
+    _clear_spin_line()
+    logger.info(result_msg)
     BUFFER.append(result_msg)
     await _broadcast(result_msg)
     return {"ok": ok, "output": output[:300]}
+
+
+@app.post("/api/erase-flash")
+async def api_erase_flash(data: dict = {}):
+    """擦除整个 flash 芯片（idf.py -p <port> erase-flash）。
+
+    会清除所有分区数据。擦除后必须重新 flash。
+    用于修复 flash 数据损坏（otadata 错乱、image header 损坏等）。
+    """
+    global IDF
+    if IDF is None:
+        return JSONResponse(
+            {"ok": False, "error": "IDF 工具未初始化"}, status_code=400
+        )
+    # erase-flash 和 flash 不能同时执行
+    with FLASH_JOB_LOCK:
+        if FLASH_JOB and FLASH_JOB.get("active"):
+            return JSONResponse(
+                {"ok": False, "error": "已有烧录任务正在执行"},
+                status_code=409,
+            )
+    if BUILD_JOB and BUILD_JOB.get("active"):
+        return JSONResponse(
+            {"ok": False, "error": "已有编译/清理任务在执行中"}, status_code=409
+        )
+
+    port = data.get("port", SERIAL.port or "COM6")
+
+    loop = asyncio.get_event_loop()
+
+    IDF.flash_progress.reset(phase="erasing")
+    IDF.flash_progress.update(message=f"擦除 flash ({port})...")
+    _broadcast_task(json.dumps(
+        {"type": "build_progress", "progress": IDF.flash_progress.to_dict()},
+        ensure_ascii=False
+    ))
+
+    # 擦除 flash 需要独占串口（和 flash 一样）
+    def _do_erase():
+        with SERIAL.acquire_for_flash():
+            return IDF.erase_flash(port=port)
+
+    ok, output = await loop.run_in_executor(None, _do_erase)
+
+    IDF.flash_progress.finish(ok)
+    _broadcast_task(json.dumps(
+        {"type": "build_progress", "progress": IDF.flash_progress.to_dict()},
+        ensure_ascii=False
+    ))
+
+    result_msg = f"[bridge] 擦除 flash {'成功' if ok else '失败'}"
+    _clear_spin_line()
+    logger.info(result_msg)
+    BUFFER.append(result_msg)
+    await _broadcast(result_msg)
+    return {"ok": ok, "output": output[:500]}
 
 
 @app.post("/api/bmgr")
