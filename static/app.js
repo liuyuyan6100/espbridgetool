@@ -751,6 +751,7 @@ function setBuildButtonsDisabled(disabled) {
     buildEls.btnBuild.disabled = disabled;
     buildEls.btnFlash.disabled = disabled;
     buildEls.btnClean.disabled = disabled;
+    buildEls.btnErase.disabled = disabled;
 }
 
 /** 编译 */
@@ -853,7 +854,7 @@ async function doEraseFlash() {
     setBuildButtonsDisabled(true);
     setBuildStatus('erasing', '擦除 flash 中 (erase-flash)...');
     try {
-        const port = currentPort || 'COM6';
+        const port = getSelectedPort() || 'COM6';
         const res = await fetch('/api/erase-flash', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
